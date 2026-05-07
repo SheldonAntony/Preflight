@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-"""Preflight MCP Server — E2E smoke test.
+﻿#!/usr/bin/env python3
+"""Preflight MCP Server â€” E2E smoke test.
 
 Tests core tool logic directly (bypasses MCP protocol) using a temp SQLite DB
 and a stubbed fastembed so the test completes in under 5 seconds.
@@ -17,7 +17,7 @@ import sqlite3
 import tempfile
 import traceback
 
-# ── Stub fastembed before importing anything that touches utils.py ─────────────
+# â”€â”€ Stub fastembed before importing anything that touches utils.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _stub_utils = types.ModuleType("utils")
 
 def _embed(text: str) -> list[float]:
@@ -36,22 +36,32 @@ _stub_utils.embed_text = _embed
 _stub_utils.cosine_similarity = _cos
 sys.modules["utils"] = _stub_utils
 
-# ── Add backend scripts dir to path ───────────────────────────────────────────
+# â”€â”€ Add backend scripts dir to path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _SCRIPTS_DIR = os.path.join(os.path.expanduser("~"), ".config", "opencode")
 sys.path.insert(0, _SCRIPTS_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ── Import mcp_server tool functions AFTER stubs are in place ─────────────────
+# â”€â”€ Import mcp_server tool functions AFTER stubs are in place â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Temporarily override _VENV_PYTHON so mcp_server doesn't try subprocess with venv
 # (we call tool fns directly, not via subprocess, in this test).
 import mcp_server as srv
 
 import memory as _mem
 
-# ── Isolated temp DB for this test run ────────────────────────────────────────
-_DB = os.path.join(tempfile.gettempdir(), "preflight_test_mcp.db")
-if os.path.exists(_DB):
-    os.remove(_DB)
+# â”€â”€ Isolated temp DB for this test run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Use a unique file per run to avoid stale WAL/SHM files on Windows.
+import uuid as _uuid
+_DB = os.path.join(tempfile.gettempdir(), f"preflight_test_{_uuid.uuid4().hex[:8]}.db")
+# Also clean up any prior fixed-name DB and its WAL/SHM sidecars.
+for _old in [
+    os.path.join(tempfile.gettempdir(), "preflight_test_mcp.db"),
+    os.path.join(tempfile.gettempdir(), "preflight_test_mcp.db-wal"),
+    os.path.join(tempfile.gettempdir(), "preflight_test_mcp.db-shm"),
+]:
+    try:
+        os.remove(_old)
+    except OSError:
+        pass
 _mem.DB_PATH = _DB
 
 # Patch _call_memory / _call_tasks / _call_classifier to call Python functions
@@ -141,7 +151,7 @@ def _patched_auto_extract(response_text: str, project_id: str, session_id: str) 
         saved.append(fact)
     return {"extracted": len(saved), "facts": saved}
 
-# ── Test helpers ───────────────────────────────────────────────────────────────
+# â”€â”€ Test helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _PASS = 0
 _FAIL = 0
 
@@ -152,12 +162,12 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         print(f"  PASS  {name}")
     else:
         _FAIL += 1
-        print(f"  FAIL  {name}" + (f" — {detail}" if detail else ""))
+        print(f"  FAIL  {name}" + (f" â€” {detail}" if detail else ""))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 1 — get_project_id
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test 1: get_project_id ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test 1 â€” get_project_id
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test 1: get_project_id â”€â”€")
 try:
     result = srv.tool_get_project_id(os.path.expanduser("~/.config/opencode"))
     pid = result.get("project_id", "")
@@ -167,10 +177,10 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 2 — store_slot / list_slots
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test 2: store_slot / list_slots ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test 2 â€” store_slot / list_slots
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test 2: store_slot / list_slots â”€â”€")
 PROJ = "smoke_test"
 SESS = "sess_smoke_1"
 try:
@@ -185,10 +195,10 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 3 — store_memory / get_context retrieves it
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test 3: store_memory → get_context retrieval ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test 3 â€” store_memory / get_context retrieves it
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test 3: store_memory â†’ get_context retrieval â”€â”€")
 try:
     srv.tool_store_memory(SESS, PROJ, "always use SQLAlchemy not raw SQL", "finding")
     ctx = srv.tool_get_context("fix the database query", "sess_smoke_2", PROJ)
@@ -200,10 +210,10 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 4 — preference fact stored in __global__ is visible from OTHER project
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test 4: global preference visible from different project ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test 4 â€” preference fact stored in __global__ is visible from OTHER project
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test 4: global preference visible from different project â”€â”€")
 OTHER_PROJ = "totally_different_project"
 try:
     srv.tool_store_memory(SESS, PROJ, "keep responses concise", "preference")
@@ -215,10 +225,10 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 5 — missing_slots when no slots stored (feature task)
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test 5: missing_slots for feature task (no slots stored) ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test 5 â€” missing_slots when no slots stored (feature task)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test 5: missing_slots for feature task (no slots stored) â”€â”€")
 EMPTY_PROJ = "fresh_project_no_slots"
 try:
     ctx3 = srv.tool_get_context("add user authentication", "sess_smoke_4", EMPTY_PROJ)
@@ -231,10 +241,10 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 6 — storing language removes it from missing_slots
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test 6: store language → it leaves missing_slots ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test 6 â€” storing language removes it from missing_slots
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test 6: store language â†’ it leaves missing_slots â”€â”€")
 try:
     srv.tool_store_slot("sess_smoke_4", EMPTY_PROJ, "language", "Python")
     ctx4 = srv.tool_get_context("add user authentication", "sess_smoke_5", EMPTY_PROJ)
@@ -248,10 +258,10 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 7 — Auto-linking: two related facts get a graph edge
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test 7: auto-link — related facts get an edge ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test 7 â€” Auto-linking: two related facts get a graph edge
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test 7: auto-link â€” related facts get an edge â”€â”€")
 GRAPH_PROJ = "graph_test_proj"
 try:
     _mem.store_fact(GRAPH_PROJ, "sess_g1", "we use SQLAlchemy as our ORM layer", "decision")
@@ -277,10 +287,10 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 8 — get_graph: SQLAlchemy fact's neighbour is the N+1 fact
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test 8: get_graph — N+1 fact appears as neighbour of SQLAlchemy fact ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test 8 â€” get_graph: SQLAlchemy fact's neighbour is the N+1 fact
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test 8: get_graph â€” N+1 fact appears as neighbour of SQLAlchemy fact â”€â”€")
 try:
     result = srv.tool_get_graph("SQLAlchemy ORM", GRAPH_PROJ, depth=1)
     root       = result.get("root")
@@ -293,10 +303,10 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 9 — auto_extract saves a FastAPI fact from a response
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test 9: auto_extract saves facts from AI response ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test 9 â€” auto_extract saves a FastAPI fact from a response
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test 9: auto_extract saves facts from AI response â”€â”€")
 EXTRACT_PROJ = "extract_test_proj"
 EXTRACT_RESP = (
     "I decided to use FastAPI for performance reasons. FastAPI uses Starlette "
@@ -312,15 +322,15 @@ try:
               any("FastAPI" in f or "framework" in f.lower() for f in ae_result["facts"]),
               f"facts: {ae_result['facts']}")
     else:
-        # Keyword extractor conservatively saved 0 — acceptable
+        # Keyword extractor conservatively saved 0 â€” acceptable
         check("auto_extract conservatively saved 0 facts (acceptable)", True)
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test 10 — retrieve_facts includes graph neighbours alongside direct matches
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test 10: retrieve_facts includes graph-expanded neighbours ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test 10 â€” retrieve_facts includes graph neighbours alongside direct matches
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test 10: retrieve_facts includes graph-expanded neighbours â”€â”€")
 EXPAND_PROJ = "expand_test_proj"
 try:
     _mem.store_fact(EXPAND_PROJ, "sess_ex1", "we use PostgreSQL as the primary database", "decision")
@@ -340,10 +350,10 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test P5-COMPAT — retrieve_facts still returns list[str] by default
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test P5-COMPAT: retrieve_facts returns list by default ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test P5-COMPAT â€” retrieve_facts still returns list[str] by default
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test P5-COMPAT: retrieve_facts returns list by default â”€â”€")
 P5_PROJ = "p5_compat_proj"
 try:
     _mem.store_fact(P5_PROJ, "sess_p5a", "we use Redis for caching sessions", "decision")
@@ -353,10 +363,10 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Test P5-OPT-IN — retrieve_facts returns dict when include_budget_info=True
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n── Test P5-OPT-IN: retrieve_facts returns dict with budget info ──")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Test P5-OPT-IN â€” retrieve_facts returns dict when include_budget_info=True
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+print("\nâ”€â”€ Test P5-OPT-IN: retrieve_facts returns dict with budget info â”€â”€")
 try:
     result_dict = _mem.retrieve_facts(
         P5_PROJ, "sess_p5b", "Redis caching",
@@ -377,13 +387,14 @@ try:
 except Exception:
     print("  ERROR:", traceback.format_exc())
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Summary
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 total = _PASS + _FAIL
-print(f"\n{'═'*50}")
-print(f"  {_PASS}/{total} passed{'  ✓  ALL PASS' if _FAIL == 0 else ''}")
+print(f"\n{'='*50}")
+print(f"  {_PASS}/{total} passed{'  ALL PASS' if _FAIL == 0 else ''}")
 if _FAIL:
     print(f"  {_FAIL} FAILED")
-print(f"{'═'*50}")
+print(f"{'='*50}")
 sys.exit(0 if _FAIL == 0 else 1)
+
