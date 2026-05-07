@@ -248,6 +248,54 @@ def tool_list_slots(project_id: str) -> dict:
         return {}
 
 
+def tool_auto_extract(
+    response_text: str,
+    project_id: str,
+    session_id: str,
+) -> dict:
+    """Extract facts from an AI response and save them automatically.
+
+    Call this after every response with the full response text.
+    Non-blocking from the caller's perspective — any extraction failure
+    is silently swallowed so it never interrupts the conversation.
+    """
+    try:
+        raw = _run(
+            [EXTRACTOR_PY, json.dumps({"text": response_text, "apiKey": None})],
+            timeout=15,
+        )
+        facts: list[str] = json.loads(raw).get("facts", [])
+    except Exception:
+        facts = []
+
+    saved: list[str] = []
+    for fact in facts:
+        try:
+            _call_memory("store_fact", project_id, session_id, fact, "finding")
+            saved.append(fact)
+        except Exception:
+            pass
+
+    return {"extracted": len(saved), "facts": saved}
+
+
+def tool_get_graph(
+    fact_content: str,
+    project_id: str,
+    depth: int = 1,
+) -> dict:
+    """Find the closest fact to fact_content and return its graph neighbourhood.
+
+    Useful for understanding why a decision was made, tracing bug causes,
+    or finding related conventions.
+    """
+    try:
+        raw = _call_memory("get_graph", project_id, fact_content, str(min(depth, 2)))
+        return json.loads(raw)
+    except Exception as exc:
+        return {"error": str(exc), "root": None, "neighbours": []}
+
+
 # ─── MCP server (stdio transport) ─────────────────────────────────────────────
 
 try:
@@ -349,6 +397,45 @@ def _build_mcp_server() -> "Server":
                     "required": ["project_id"],
                 },
             ),
+            mcp_types.Tool(
+                name="auto_extract",
+                description=(
+                    "Call after every AI response with the full response text. "
+                    "Automatically extracts and saves important facts without the LLM "
+                    "having to identify them manually. Non-blocking — always safe to call."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "response_text": {"type": "string"},
+                        "project_id":    {"type": "string"},
+                        "session_id":    {"type": "string"},
+                    },
+                    "required": ["response_text", "project_id", "session_id"],
+                },
+            ),
+            mcp_types.Tool(
+                name="get_graph",
+                description=(
+                    "Given a fact or topic string, finds the most similar stored fact "
+                    "and returns its connected graph neighbours. Use when the user asks "
+                    "WHY a decision was made, HOW a bug was caused, or what is RELATED "
+                    "to a topic."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "fact_content": {"type": "string"},
+                        "project_id":   {"type": "string"},
+                        "depth": {
+                            "type": "integer",
+                            "default": 1,
+                            "description": "Graph traversal depth. Max 2.",
+                        },
+                    },
+                    "required": ["fact_content", "project_id"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -381,6 +468,18 @@ def _build_mcp_server() -> "Server":
                 )
             elif name == "list_slots":
                 result = tool_list_slots(project_id=arguments["project_id"])
+            elif name == "auto_extract":
+                result = tool_auto_extract(
+                    response_text=arguments["response_text"],
+                    project_id=arguments["project_id"],
+                    session_id=arguments["session_id"],
+                )
+            elif name == "get_graph":
+                result = tool_get_graph(
+                    fact_content=arguments["fact_content"],
+                    project_id=arguments["project_id"],
+                    depth=arguments.get("depth", 1),
+                )
             else:
                 result = {"error": f"Unknown tool: {name}"}
         except Exception as exc:
