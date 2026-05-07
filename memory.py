@@ -21,6 +21,21 @@ from utils import cosine_similarity, embed_text
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory.db")
 
+# Content-type decay rates (per-day, inspired by ClawMem).
+# decision/preference/finding never decay; notes/snippets/summaries decay faster.
+_DECAY_RATES: dict[str, float] = {
+    "decision":   0.0,     # architectural choices, never decay
+    "preference": 0.0,     # user/team preferences, never decay
+    "finding":    0.005,   # discovered facts about codebase, slow decay
+    "snippet":    0.015,   # code snippets, medium decay
+    "summary":    0.02,    # session summaries
+    "note":       0.02,    # default — generic notes
+}
+
+# Similarity threshold above which a new fact is treated as a contradiction
+# / near-duplicate of an existing one and replaces it instead of inserting.
+_CONTRADICTION_THRESHOLD = 0.88
+
 
 # ─── Database init ────────────────────────────────────────────────────────────
 
@@ -35,6 +50,7 @@ def init_db() -> sqlite3.Connection:
             project_id      TEXT,
             content         TEXT,
             embedding       TEXT,
+            fact_type       TEXT DEFAULT 'note',
             retrieval_count INTEGER DEFAULT 0,
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -55,12 +71,29 @@ def init_db() -> sqlite3.Connection:
         )
     """)
 
+    # FTS5 keyword index (BM25) — half of the hybrid search.
+    # Uses external rowid mapped to facts.id; manually kept in sync from store/update paths.
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+            content,
+            content='facts',
+            content_rowid='id'
+        )
+    """)
+
     # Feature 2: migrations — add project_id if the table already exists
     _ensure_column(conn, "facts",      "project_id",      "TEXT",      "'unknown'")
     _ensure_column(conn, "facts",      "retrieval_count", "INTEGER",   "0")
     _ensure_column(conn, "facts",      "created_at",      "TIMESTAMP", "CURRENT_TIMESTAMP")
+    _ensure_column(conn, "facts",      "fact_type",       "TEXT",      "'note'")
     _ensure_column(conn, "slot_fills", "project_id",      "TEXT",      "'unknown'")
     _ensure_column(conn, "slot_fills", "created_at",      "TIMESTAMP", "CURRENT_TIMESTAMP")
+
+    # Backfill FTS5 index from any pre-existing facts (one-time, cheap if empty).
+    fts_count = conn.execute("SELECT COUNT(*) FROM facts_fts").fetchone()[0]
+    facts_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    if fts_count < facts_count:
+        conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
 
     conn.commit()
     return conn
@@ -94,15 +127,83 @@ def mark_stored(key: str) -> None:
 
 # ─── Facts (semantic memory) ──────────────────────────────────────────────────
 
-def store_fact(project_id: str, session_id: str, text: str) -> None:
+def store_fact(project_id: str, session_id: str, text: str,
+               fact_type: str = "note") -> None:
+    """Store a fact, replacing near-duplicates instead of inserting them.
+
+    Contradiction detection: if any existing fact in the same project has
+    cosine similarity >= _CONTRADICTION_THRESHOLD with the new text, we
+    overwrite that row in-place. This handles both verbatim duplicates and
+    paraphrased restatements (e.g. "we use Postgres" → "switched to MySQL"
+    when the latter is similar enough to the former).
+    """
     emb = embed_text(text)
     conn = init_db()
-    conn.execute(
-        "INSERT INTO facts (project_id, session_id, content, embedding) VALUES (?, ?, ?, ?)",
-        (project_id, session_id, text, json.dumps(emb)),
+
+    # Find the most-similar existing fact in this project (last 200 only —
+    # bounded for speed; older near-duplicates are acceptable to keep).
+    cursor = conn.execute(
+        """SELECT id, embedding FROM facts
+           WHERE project_id = ?
+           ORDER BY id DESC LIMIT 200""",
+        (project_id,),
     )
+    best_id: int | None = None
+    best_sim: float = 0.0
+    for row_id, emb_json in cursor.fetchall():
+        if not emb_json:
+            continue
+        try:
+            existing_emb = json.loads(emb_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        sim = cosine_similarity(emb, existing_emb)
+        if sim > best_sim:
+            best_sim = sim
+            best_id = row_id
+
+    if best_id is not None and best_sim >= _CONTRADICTION_THRESHOLD:
+        # Replace the contradicted/duplicate fact in place.
+        conn.execute(
+            """UPDATE facts
+               SET content = ?, embedding = ?, fact_type = ?, session_id = ?
+               WHERE id = ?""",
+            (text, json.dumps(emb), fact_type, session_id, best_id),
+        )
+        # Keep the FTS5 mirror in sync.
+        conn.execute("DELETE FROM facts_fts WHERE rowid = ?", (best_id,))
+        conn.execute(
+            "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
+            (best_id, text),
+        )
+    else:
+        cur = conn.execute(
+            """INSERT INTO facts (project_id, session_id, content, embedding, fact_type)
+               VALUES (?, ?, ?, ?, ?)""",
+            (project_id, session_id, text, json.dumps(emb), fact_type),
+        )
+        new_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
+            (new_id, text),
+        )
+
     conn.commit()
     conn.close()
+
+
+def _fts5_query(prompt: str) -> str:
+    """Sanitize a user prompt into a safe FTS5 MATCH query.
+
+    Strips FTS5 special chars and joins remaining tokens with OR so any
+    keyword can match. Returns empty string when no usable tokens remain.
+    """
+    safe = "".join(c if c.isalnum() or c.isspace() else " " for c in prompt)
+    tokens = [t for t in safe.split() if len(t) > 2]
+    if not tokens:
+        return ""
+    # Quote each token to avoid FTS5 keyword collisions (AND/OR/NOT/NEAR).
+    return " OR ".join(f'"{t}"' for t in tokens)
 
 
 def retrieve_facts(
@@ -112,65 +213,117 @@ def retrieve_facts(
     top_n: int = 3,
     threshold: float = 0.25,
 ) -> list[str]:
-    """Feature 3: weighted retrieval — semantic + recency + frequency."""
+    """Hybrid retrieval: BM25 + vector via Reciprocal Rank Fusion (RRF),
+    then weighted with content-type-aware recency and frequency.
+
+    Score = 0.5 * fused_rank + 0.3 * type_weighted_recency + 0.2 * frequency
+    """
     conn = init_db()
+
+    # ── 1. Pull candidate pool (last 200 facts in project) ────────────────
     cursor = conn.execute(
-        """SELECT content, embedding, retrieval_count, created_at
+        """SELECT id, content, embedding, retrieval_count, created_at, fact_type
            FROM facts
            WHERE project_id = ?
            ORDER BY id DESC LIMIT 200""",
         (project_id,),
     )
-    rows = [
-        (content, json.loads(emb), rc, ca)
-        for content, emb, rc, ca in cursor.fetchall()
-        if emb
-    ]
+    rows: list[tuple[int, str, list[float], int, str, str]] = []
+    for fid, content, emb_json, rc, ca, ft in cursor.fetchall():
+        if not emb_json:
+            continue
+        try:
+            emb = json.loads(emb_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        rows.append((fid, content, emb, rc, ca, ft or "note"))
+
+    if not rows:
+        conn.close()
+        return []
+
     max_rc_row = conn.execute(
         "SELECT COALESCE(MAX(retrieval_count), 1) FROM facts WHERE project_id = ?",
         (project_id,),
     ).fetchone()
-    conn.close()
-
-    if not rows:
-        return []
-
-    prompt_emb = embed_text(prompt)
-    now = datetime.now(timezone.utc)
     max_rc = max_rc_row[0] if max_rc_row and max_rc_row[0] else 1
 
-    scored: list[tuple[float, str, int]] = []
-    for content, emb, rc, created_at in rows:
-        # 1. Semantic similarity (weight 0.5)
-        sem = cosine_similarity(prompt_emb, emb)
+    # ── 2. Vector ranking (cosine similarity) ─────────────────────────────
+    prompt_emb = embed_text(prompt)
+    vec_scored = sorted(
+        (
+            (cosine_similarity(prompt_emb, emb), fid)
+            for fid, _c, emb, _rc, _ca, _ft in rows
+        ),
+        reverse=True,
+        key=lambda x: x[0],
+    )
+    vec_rank: dict[int, int] = {fid: rank for rank, (_s, fid) in enumerate(vec_scored)}
 
-        # 2. Recency score (weight 0.3)
+    # ── 3. BM25 ranking via FTS5 (returns lowest = best match) ────────────
+    bm25_rank: dict[int, int] = {}
+    fts_query = _fts5_query(prompt)
+    if fts_query:
+        candidate_ids = tuple(fid for fid, *_rest in rows)
+        placeholders = ",".join("?" for _ in candidate_ids)
+        try:
+            bm_cursor = conn.execute(
+                f"""SELECT rowid FROM facts_fts
+                    WHERE facts_fts MATCH ?
+                      AND rowid IN ({placeholders})
+                    ORDER BY bm25(facts_fts)""",
+                (fts_query, *candidate_ids),
+            )
+            for rank, (fid,) in enumerate(bm_cursor.fetchall()):
+                bm25_rank[fid] = rank
+        except sqlite3.OperationalError:
+            # Malformed query or FTS5 unavailable — silently skip BM25 leg.
+            bm25_rank = {}
+
+    # ── 4. RRF fusion + weighted scoring ──────────────────────────────────
+    # Standard RRF scores are tiny (~0.03 max) — normalize within the batch
+    # so the relevance leg is comparable to recency/freq.
+    K = 60
+    raw_rrf: dict[int, float] = {}
+    for fid, *_rest in rows:
+        s = 1.0 / (K + vec_rank.get(fid, len(rows)))
+        if fid in bm25_rank:
+            s += 1.0 / (K + bm25_rank[fid])
+        raw_rrf[fid] = s
+    max_rrf = max(raw_rrf.values()) if raw_rrf else 1.0
+
+    now = datetime.now(timezone.utc)
+    scored: list[tuple[float, int, str]] = []
+    for fid, content, _emb, rc, created_at, fact_type in rows:
+        rrf = (raw_rrf[fid] / max_rrf) if max_rrf > 0 else 0.0
+
+        # Content-type-aware recency decay (decisions don't decay).
         try:
             ca_dt = _parse_dt(created_at)
         except Exception:
             ca_dt = now
         days = max(0, (now - ca_dt).days)
-        recency = 1 / (1 + days)
+        decay = _DECAY_RATES.get(fact_type, _DECAY_RATES["note"])
+        recency = 1.0 / (1.0 + decay * days) if decay > 0 else 1.0
 
-        # 3. Frequency score (weight 0.2)
+        # Frequency normalized by project max.
         freq = (rc / max_rc) if max_rc > 0 else 0
 
-        combined = 0.5 * sem + 0.3 * recency + 0.2 * freq
-        scored.append((combined, content, rc))
+        combined = 0.5 * rrf + 0.3 * recency + 0.2 * freq
+        scored.append((combined, fid, content))
 
     scored.sort(reverse=True, key=lambda x: x[0])
 
-    # Feature 4: configurable threshold; also increment retrieval_count
+    # ── 5. Apply threshold and bump retrieval_count ───────────────────────
+    # Note: rrf scores are small (<0.04), so the historical 0.25 threshold
+    # mostly rejects via recency/freq contributions. Kept for compatibility.
     results: list[str] = []
-    conn = init_db()
-    for score, content, _rc in scored[:top_n]:
+    for score, fid, content in scored[:top_n]:
         if score >= threshold:
             results.append(content)
             conn.execute(
-                """UPDATE facts
-                   SET retrieval_count = retrieval_count + 1
-                   WHERE content = ? AND project_id = ?""",
-                (content, project_id),
+                "UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE id = ?",
+                (fid,),
             )
     conn.commit()
     conn.close()
@@ -231,7 +384,8 @@ if __name__ == "__main__":
 
     if cmd == "store_fact":
         project_id, session_id, text = sys.argv[2], sys.argv[3], sys.argv[4]
-        store_fact(project_id, session_id, text)
+        fact_type = sys.argv[5] if len(sys.argv) > 5 else "note"
+        store_fact(project_id, session_id, text, fact_type)
 
     elif cmd == "retrieve_facts":
         project_id, session_id, prompt = sys.argv[2], sys.argv[3], sys.argv[4]

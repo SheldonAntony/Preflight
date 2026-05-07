@@ -167,7 +167,7 @@ async function storeSessionMessage(
   const key = crypto.createHash("sha256").update(text).digest("hex").slice(0, 16)
   if (await isDuplicate(key)) return
   try {
-    await callPython([MEMORY_SCRIPT, "store_fact", projectId, sessionId, text], 15_000)
+    await callPython([MEMORY_SCRIPT, "store_fact", projectId, sessionId, text, "note"], 15_000)
     await markStored(key)
   } catch { /* silently ignore */ }
 }
@@ -176,9 +176,10 @@ async function storeMemory(
   projectId: string,
   sessionId: string,
   text: string,
+  factType: string = "finding",
 ): Promise<void> {
   try {
-    await callPython([MEMORY_SCRIPT, "store_fact", projectId, sessionId, text], 15_000)
+    await callPython([MEMORY_SCRIPT, "store_fact", projectId, sessionId, text, factType], 15_000)
   } catch { /* silently ignore */ }
 }
 
