@@ -571,7 +571,8 @@ def _get_cross_encoder():
 
 def store_fact(project_id: str, session_id: str, text: str,
                fact_type: str = "note", enrich: bool = True,
-               _embed_text: "str | None" = None) -> "int | None":
+               _embed_text: "str | None" = None,
+               _precomputed_emb: "list[float] | None" = None) -> "int | None":
     """Store a fact with soft-expire on contradiction, binary embedding, entity extraction.
 
     Contradiction detection: cosine similarity >= _CONTRADICTION_THRESHOLD writes a
@@ -584,9 +585,17 @@ def store_fact(project_id: str, session_id: str, text: str,
     `text`.  The DB content column still stores `text`.  Use this in store_turn_window
     to embed only the [curr] turn so ANN search is precise, while storing the full
     3-turn window for context display.
+
+    _precomputed_emb: when provided, skip the embed_text() call entirely and use this
+    pre-computed vector.  Takes priority over _embed_text.  Use in store_turn_window
+    to share a single embedding between the turn row and the window row (both embed
+    the same curr_line text), halving the number of model inference calls.
     """
     global _compacted_this_process
-    emb = embed_text(_embed_text if _embed_text is not None else text)
+    if _precomputed_emb is not None:
+        emb = _precomputed_emb
+    else:
+        emb = embed_text(_embed_text if _embed_text is not None else text)
     conn = init_db()
 
     # Phase 7.5: compact old INSERT mutations once per process lifetime.
@@ -908,15 +917,18 @@ def store_turn_window(
     content = "\n".join(window)
     # Embed only the [curr] turn so ANN search is precise; store full window for context.
     embed_hint = curr_line if curr_line else content
+    # Compute the [curr]-turn embedding ONCE and share it between the turn row and
+    # window row — both use the same vector, so one model inference call suffices.
+    shared_emb = embed_text(embed_hint)
     # Store the clean single-turn fact FIRST (fact_type="turn") so it gets a lower
     # row id than the window row.  Tests that fetch ORDER BY id DESC LIMIT 1 will
     # get the window row (richer context); retrieval can return either row.
     if curr_line:
         store_fact(project_id, session_id, curr_line, "turn", enrich=False,
-                   _embed_text=curr_line)
+                   _precomputed_emb=shared_emb)
     # Window row stored second — last inserted, richer 3-turn context for display.
     window_fid = store_fact(project_id, session_id, content, fact_type, enrich=False,
-                            _embed_text=embed_hint)
+                            _precomputed_emb=shared_emb)
     # Extract and store atomic SVO facts for higher-precision retrieval.
     # Skip during bulk ingestion (extract_svo=False) — spaCy is ~0.5s/window.
     if extract_svo:
