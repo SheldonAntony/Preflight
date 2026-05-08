@@ -508,11 +508,18 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
         pid_map = dia_id_map.get(pid, {})
         print(f"  Conv {si+1}/{len(samples)}: loading embeddings...", flush=True)
 
-        # One DB read per conversation — preload all facts into memory
+        # One DB read per conversation — preload all facts into memory.
+        # Exclude fact_type='turn' rows: they share an identical embedding with
+        # their companion window row (both embed the same [curr] turn text).
+        # Including both wastes top-K slots — two rows tie on cosine score for
+        # the same turn, halving effective K.  Window rows carry the embedding
+        # and are sufficient; turn rows help BM25/CE in production retrieve_facts()
+        # but add no signal in this pure-cosine eval scorer.
         rows = conn.execute(
             """SELECT id, content, embedding FROM facts
                WHERE project_id = ?
                  AND superseded_at IS NULL
+                 AND fact_type != 'turn'
                  AND (valid_to IS NULL OR valid_to > unixepoch())""",
             (pid,),
         ).fetchall()
