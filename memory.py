@@ -1004,6 +1004,13 @@ def retrieve_facts(
         _stages["pool_size"] = len(_pool_fids)
 
     rows: list = []
+    def _safe_ef(v, default=2.5):
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, (bytes, bytearray)) and len(v) == 4:
+            import struct as _struct
+            return _struct.unpack("f", v)[0]
+        return default
     for fid, content, emb_data, rc, ca, ft, ef, lra, ivd, ents, imp, fsid in all_candidate_rows:
         emb = _decode_embedding(emb_data)
         if emb is None:
@@ -1011,7 +1018,7 @@ def retrieve_facts(
         rows.append((
             fid, content, emb,
             rc or 0, ca, ft or "note",
-            ef if ef is not None else 2.5,
+            _safe_ef(ef) if ef is not None else 2.5,
             lra,
             ivd if ivd is not None else 1.0,
             ents,
