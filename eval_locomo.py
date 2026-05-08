@@ -288,12 +288,17 @@ def _eval_retrieve(db_path: str, project_id: str, question: str, top_n: int = 5)
 
 
 def build_dia_id_map(samples: list, db_path: str) -> dict:
-    """Build project_id → {dia_id → fact_id} by matching turn content in the DB.
+    """Build project_id → {dia_id → set[fact_id]} by matching turn content in the DB.
 
-    Lightweight pass (no embeddings) — uses exact content match between the
-    'speaker: text' strings stored during ingestion and the DB facts table.
+    Collects ALL fact_ids that contain a given turn: window rows via [curr] tag,
+    turn rows via plain content fallback.  Recall@K hits if ANY fid in the set
+    appears in top-K — so retrieving either the window or the clean turn row counts.
+
+    Two-pass strategy: [prev]/[next] tag matches go in first, [curr] tag matches
+    overwrite (higher priority).  Plain-text rows (no window tags) go in via fallback.
+    Both window and turn fids for the same "Speaker: text" are collected into one set.
     """
-    dia_id_map: dict[str, dict[int, int]] = {}
+    dia_id_map: dict[str, dict[str, set]] = {}
     conn = sqlite3.connect(db_path)
     for ci, sample in enumerate(samples):
         sid_str = str(sample.get("sample_id", ci))
@@ -302,22 +307,22 @@ def build_dia_id_map(samples: list, db_path: str) -> dict:
             "SELECT id, content FROM facts WHERE project_id = ? AND superseded_at IS NULL",
             (pid,),
         ).fetchall()
-        content_to_id: dict[str, int] = {}
-        # Two-pass: [prev]/[next] first (lower priority), then [curr] overwrites.
-        # This ensures every turn's "speaker: text" is mapped, even if it only
-        # appears as context in neighbouring window facts.
+        # Maps "Speaker: text" → set of fact_ids (window fid via [curr] tag + turn fid via fallback).
+        content_to_ids: dict[str, set] = {}
+        # Two-pass: [prev]/[next] tag matches first (lower priority), then [curr].
         for priority_tags in (("[prev] ", "[next] "), ("[curr] ",)):
             for fid, content in rows:
                 for line in content.split("\n"):
                     for tag in priority_tags:
                         if line.startswith(tag):
-                            content_to_id[line[len(tag):]] = fid
-        # Fallback for plain (non-window) facts stored without turn tags.
+                            key = line[len(tag):]
+                            content_to_ids.setdefault(key, set()).add(fid)
+        # Fallback: plain rows without any window tags (covers fact_type="turn" rows).
         for fid, content in rows:
             if not any(content.startswith(t) or "\n" + t in content
                        for t in ("[curr] ", "[prev] ", "[next] ")):
-                content_to_id[content] = fid
-        pid_map: dict[int, int] = {}
+                content_to_ids.setdefault(content, set()).add(fid)
+        pid_map: dict[str, set] = {}
         conv = sample.get("conversation", {})
         for sn, _date, turns in iter_sessions(conv):
             for turn in turns:
@@ -327,9 +332,9 @@ def build_dia_id_map(samples: list, db_path: str) -> dict:
                 if not text.strip() or dia_id is None:
                     continue
                 content = f"{speaker}: {text}"
-                fid = content_to_id.get(content)
-                if fid is not None:
-                    pid_map[str(dia_id)] = fid
+                fids = content_to_ids.get(content)
+                if fids:
+                    pid_map[str(dia_id)] = fids
         dia_id_map[pid] = pid_map
     conn.close()
     return dia_id_map
