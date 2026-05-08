@@ -11,7 +11,7 @@ Usage:
     python3.13 diag_locomo.py
 """
 from __future__ import annotations
-import json, sqlite3, struct, sys, os, time
+import json, re, sqlite3, struct, sys, os, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "opencode"))
@@ -25,17 +25,25 @@ MAX_QA    = 300   # cap for speed — set to 9999 for full run
 
 # ── Helpers from eval_locomo.py ───────────────────────────────────────────────
 def iter_sessions(conv: dict):
-    for sn_str, session in conv.items():
-        try:
-            sn = int(sn_str)
-        except ValueError:
-            continue
-        turns = session.get("dialogue", [])
-        date  = session.get("date", "")
-        yield sn, date, turns
+    nums = sorted(
+        int(k.split("_")[1])
+        for k in conv
+        if re.match(r"^session_\d+$", k)
+    )
+    for n in nums:
+        turns    = conv.get(f"session_{n}", [])
+        date_str = conv.get(f"session_{n}_date_time", "")
+        yield n, str(date_str), turns
+
+_TAG_PREFIXES = ("[curr] ", "[prev] ", "[next] ")
 
 def build_dia_id_map(samples: list) -> dict:
-    """Map project_id → {dia_id_str → fact_id} using [curr] line matching."""
+    """Map project_id -> {dia_id_str -> fact_id} using tagged-line matching.
+
+    Maps ALL tag positions ([prev]/[curr]/[next]) so that turns that appear
+    only as context lines in surviving window facts are still reachable.
+    [curr] takes priority over [prev]/[next] if a turn appears in multiple facts.
+    """
     conn = sqlite3.connect(str(DB_B))
     result: dict[str, dict[str, int]] = {}
     for ci, sample in enumerate(samples):
@@ -45,14 +53,14 @@ def build_dia_id_map(samples: list) -> dict:
             "SELECT id, content FROM facts WHERE project_id = ? AND superseded_at IS NULL",
             (pid,),
         ).fetchall()
+        # Two-pass: first [prev]/[next] (lower priority), then [curr] (overwrites)
         content_to_id: dict[str, int] = {}
-        for fid, content in rows:
-            for line in content.split("\n"):
-                if line.startswith("[curr] "):
-                    content_to_id[line[len("[curr] "):]] = fid
-                    break
-            else:
-                content_to_id[content] = fid
+        for priority_tags in (("[prev] ", "[next] "), ("[curr] ",)):
+            for fid, content in rows:
+                for line in content.split("\n"):
+                    for tag in priority_tags:
+                        if line.startswith(tag):
+                            content_to_id[line[len(tag):]] = fid
         pid_map: dict[str, int] = {}
         conv = sample.get("conversation", {})
         for sn, _date, turns in iter_sessions(conv):
@@ -191,7 +199,7 @@ def main():
 
     elapsed = time.time() - t0
     OUT_CSV.write_text("\n".join(csv_rows), encoding="utf-8")
-    print(f"  Done in {elapsed:.1f}s — {has_gold} QA pairs with gold evidence\n")
+    print(f"  Done in {elapsed:.1f}s - {has_gold} QA pairs with gold evidence\n")
 
     # ── Summary table ─────────────────────────────────────────────────────────
     def pct(n, d): return f"{100*n/d:.1f}%" if d else "N/A"
@@ -208,7 +216,7 @@ def main():
     print("-" * 65)
 
     for label, key, note in [
-        ("Pool (500-cap)",   "pool",   "gold fact not in A+B pool → raise limits"),
+        ("Pool (500-cap)",   "pool",   "gold fact not in A+B pool -> raise limits"),
         ("Post-scoring",     "scored", "gold fact dropped by score filter"),
         ("Post-SM-2 gate",   "gated",  "gold gated by SM-2 interval"),
         ("Post-MMR",         "mmr",    "gold survives MMR or pushed to remaining"),
@@ -230,21 +238,21 @@ def main():
     avg_pool_pos  = sum(stages["pool"]["positions"]) / max(len(stages["pool"]["positions"]), 1)
 
     if pool_miss_pct > 0.1:
-        print(f"  ⚠ {pool_miss_pct:.0%} of gold facts missing from pool → raise _POOL_A_LIMIT or _POOL_B_LIMIT")
+        print(f"  !! {pool_miss_pct:.0%} of gold facts missing from pool -> raise _POOL_A_LIMIT or _POOL_B_LIMIT")
     else:
-        print(f"  ✓ Pool coverage good ({pool_miss_pct:.0%} miss rate)")
+        print(f"  OK Pool coverage good ({pool_miss_pct:.0%} miss rate)")
 
     if avg_pool_pos > 150:
-        print(f"  ⚠ Avg gold position in pool = {avg_pool_pos:.0f} → scoring weights may need tuning")
+        print(f"  !! Avg gold position in pool = {avg_pool_pos:.0f} -> scoring weights may need tuning")
     else:
-        print(f"  ✓ Avg gold pool position = {avg_pool_pos:.0f}")
+        print(f"  OK Avg gold pool position = {avg_pool_pos:.0f}")
 
     if mmr_demotion > 0.2:
-        print(f"  ⚠ MMR demotes {mmr_demotion:.0%} of gold facts out of top-20 → lower _MMR_LAMBDA (current=0.6)")
+        print(f"  !! MMR demotes {mmr_demotion:.0%} of gold facts out of top-20 -> lower _MMR_LAMBDA (current=0.6)")
     else:
-        print(f"  ✓ MMR demotion rate acceptable ({mmr_demotion:.0%})")
+        print(f"  OK MMR demotion rate acceptable ({mmr_demotion:.0%})")
 
-    print(f"\n  Full CSV saved → {OUT_CSV}")
+    print(f"\n  Full CSV saved -> {OUT_CSV}")
     print("=" * 65)
 
 
