@@ -788,51 +788,59 @@ def store_fact(project_id: str, session_id: str, text: str,
             )
 
     # ── Auto-link: graph edges to semantically related existing facts ─────
-    link_cursor = conn.execute(
-        """SELECT id, content, embedding FROM facts
-           WHERE project_id = ? AND id != ?
-             AND superseded_at IS NULL
-             AND (valid_to IS NULL OR valid_to > unixepoch())
-           ORDER BY id DESC LIMIT 50""",
-        (project_id, saved_id),
-    )
-    for neighbor_id, neighbor_content, neighbor_emb_data in link_cursor.fetchall():
-        neighbor_emb = _decode_embedding(neighbor_emb_data)
-        if neighbor_emb is None:
-            continue
-        sim = cosine_similarity(emb, neighbor_emb)
-        if sim >= _RELATION_THRESHOLD:
-            relation = _infer_relation(text, neighbor_content, sim)
-            id_a, id_b = min(saved_id, neighbor_id), max(saved_id, neighbor_id)
-            conn.execute(
-                """INSERT OR IGNORE INTO fact_relations
-                   (fact_id_a, fact_id_b, relation, strength)
-                   VALUES (?, ?, ?, ?)""",
-                (id_a, id_b, relation, round(sim, 4)),
-            )
+    # Skip for window/turn rows: they embed the same [curr] turn text, so
+    # adjacent turns hit _RELATION_THRESHOLD for every neighbour (cosine ~0.8+)
+    # producing O(n²) inserts into fact_relations. The graph is not consulted
+    # by retrieve_facts for these row types anyway (pure cosine ANN).
+    if fact_type not in ("window", "turn"):
+        link_cursor = conn.execute(
+            """SELECT id, content, embedding FROM facts
+               WHERE project_id = ? AND id != ?
+                 AND superseded_at IS NULL
+                 AND (valid_to IS NULL OR valid_to > unixepoch())
+               ORDER BY id DESC LIMIT 50""",
+            (project_id, saved_id),
+        )
+        for neighbor_id, neighbor_content, neighbor_emb_data in link_cursor.fetchall():
+            neighbor_emb = _decode_embedding(neighbor_emb_data)
+            if neighbor_emb is None:
+                continue
+            sim = cosine_similarity(emb, neighbor_emb)
+            if sim >= _RELATION_THRESHOLD:
+                relation = _infer_relation(text, neighbor_content, sim)
+                id_a, id_b = min(saved_id, neighbor_id), max(saved_id, neighbor_id)
+                conn.execute(
+                    """INSERT OR IGNORE INTO fact_relations
+                       (fact_id_a, fact_id_b, relation, strength)
+                       VALUES (?, ?, ?, ?)""",
+                    (id_a, id_b, relation, round(sim, 4)),
+                )
 
     # ── Temporal proximity linking ─────────────────────────────────────────
     # Link to the last _TEMPORAL_MAX_DISTANCE facts in the same session.
     # Bridges conversationally adjacent facts that may be semantically unrelated.
-    temporal_neighbors = conn.execute(
-        """SELECT id FROM facts
-           WHERE project_id = ? AND session_id = ? AND id != ?
-             AND superseded_at IS NULL
-           ORDER BY id DESC LIMIT ?""",
-        (project_id, session_id, saved_id, _TEMPORAL_MAX_DISTANCE),
-    ).fetchall()
-    for distance, (neighbor_id,) in enumerate(temporal_neighbors, start=1):
-        t_strength = round(max(0.0, 1.0 - (distance - 1) * _TEMPORAL_EDGE_DECAY), 4)
-        t_id_a, t_id_b = min(saved_id, neighbor_id), max(saved_id, neighbor_id)
-        conn.execute(
-            """INSERT INTO fact_relations (fact_id_a, fact_id_b, relation, strength)
-               VALUES (?, ?, 'temporal', ?)
-               ON CONFLICT(fact_id_a, fact_id_b) DO UPDATE SET
-                   strength = excluded.strength,
-                   relation = 'temporal'
-               WHERE excluded.strength > strength""",
-            (t_id_a, t_id_b, t_strength),
-        )
+    # Also skip for window/turn rows — temporal links between adjacent turns are
+    # already implicit in the sliding window structure; the graph adds no signal.
+    if fact_type not in ("window", "turn"):
+        temporal_neighbors = conn.execute(
+            """SELECT id FROM facts
+               WHERE project_id = ? AND session_id = ? AND id != ?
+                 AND superseded_at IS NULL
+               ORDER BY id DESC LIMIT ?""",
+            (project_id, session_id, saved_id, _TEMPORAL_MAX_DISTANCE),
+        ).fetchall()
+        for distance, (neighbor_id,) in enumerate(temporal_neighbors, start=1):
+            t_strength = round(max(0.0, 1.0 - (distance - 1) * _TEMPORAL_EDGE_DECAY), 4)
+            t_id_a, t_id_b = min(saved_id, neighbor_id), max(saved_id, neighbor_id)
+            conn.execute(
+                """INSERT INTO fact_relations (fact_id_a, fact_id_b, relation, strength)
+                   VALUES (?, ?, 'temporal', ?)
+                   ON CONFLICT(fact_id_a, fact_id_b) DO UPDATE SET
+                       strength = excluded.strength,
+                       relation = 'temporal'
+                   WHERE excluded.strength > strength""",
+                (t_id_a, t_id_b, t_strength),
+            )
 
     conn.commit()
     conn.close()
