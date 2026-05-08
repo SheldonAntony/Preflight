@@ -685,7 +685,7 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                     safe = "".join(c if c.isalnum() or c.isspace() else " " for c in qa["question"])
                     tokens = [t for t in safe.split() if len(t) > 2]
                     if tokens:
-                        fts_q = " OR ".join(f'"{{t}}"' for t in tokens)
+                        fts_q = " OR ".join(f'"{t}"' for t in tokens)
                         if fids_in_cache:
                             fids_set = set(fids_in_cache)
                             bm_rows = conn.execute(
