@@ -19,6 +19,7 @@ CLI usage:
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import struct
 import sys
@@ -51,6 +52,7 @@ _DECAY_RATES: dict[str, float] = {
     "snippet":    0.015,   # code snippets, medium decay
     "summary":    0.02,    # session summaries
     "note":       0.02,    # default — generic notes
+    "window":     0.03,    # sliding-window turns — fast decay, demoted in scoring
 }
 
 # Similarity threshold above which a new fact is treated as a contradiction
@@ -73,6 +75,7 @@ RELATION_TYPES: dict[str, float] = {
 _IMPORTANCE_TYPE_WEIGHTS: dict[str, float] = {
     "decision": 1.0, "preference": 0.9, "finding": 0.7,
     "snippet": 0.5, "summary": 0.4, "note": 0.3,
+    "window": 0.05,    # window facts rank below atomic notes by default
 }
 _IMPORTANCE_KEYWORDS: frozenset = frozenset({
     "never", "always", "must", "critical", "required", "forbidden",
@@ -86,6 +89,10 @@ _IMPORTANCE_KEYWORDS: frozenset = frozenset({
 _MMR_LAMBDA = 0.6          # legacy — kept for reference, not used directly below
 _MMR_LAMBDA_PRE_CE  = 1.0  # pre-CE selection: pure top-k by relevance
 _MMR_LAMBDA_POST_CE = 0.25 # post-CE output: light diversity deduplication
+
+# Step 6: window demotion factor — applied to composite score for fact_type="window".
+# Keeps windows retrievable as fallback while atomic SVO facts rank above them.
+_WINDOW_DEMOTION = 0.55
 
 # SM-2 gate: when False, SM-2 interval check is skipped for candidate selection.
 # EF/interval updates still happen on retrieval — they feed the staleness score.
@@ -110,6 +117,83 @@ _ENRICH_MIN_SIM        = 0.15   # minimum cosine similarity to existing fact bef
 # _cache_dirty tracks which projects need a reload after a write.
 _EMB_CACHE: "dict[str, tuple[list[int], object]]" = {}
 _CACHE_DIRTY: "set[str]" = set()
+
+# ── spaCy lazy loader (Step 6 SVO extraction) ────────────────────────────────
+# Set to None before first use, False after a failed load attempt.
+_nlp = None
+_WINDOW_TAG_RE = re.compile(r'^\[(prev|curr|next)\]\s*')
+
+
+def _get_nlp():
+    """Return a loaded spaCy en_core_web_sm model, or None if unavailable."""
+    global _nlp
+    if _nlp is None:
+        try:
+            import spacy  # noqa: PLC0415
+            _nlp = spacy.load("en_core_web_sm")
+        except Exception:
+            _nlp = False
+    return _nlp if _nlp is not False else None
+
+
+def _extract_svo_facts(window_content: str) -> list[str]:
+    """Extract subject-verb-object triples from a turn window for atomic storage.
+
+    Each line in *window_content* has the form '[tag] Speaker: text'.
+    First-person pronouns are replaced by the speaker name so that 'I went to
+    Paris' becomes 'Alice went to Paris' — making the triple unambiguous.
+
+    Returns compact fact strings (3-15 words).  Empty list if spaCy is not
+    available or no useful triples can be extracted.
+    """
+    nlp = _get_nlp()
+    if nlp is None:
+        return []
+    facts: list[str] = []
+    for line in window_content.splitlines():
+        line = _WINDOW_TAG_RE.sub("", line).strip()
+        if ": " not in line:
+            continue
+        speaker, _, text = line.partition(": ")
+        speaker = speaker.strip()
+        if not speaker or not text.strip():
+            continue
+        # Bind first-person pronouns to the speaker for disambiguation.
+        bound = re.sub(r"\bI\b", speaker, text)
+        bound = re.sub(r"\bme\b",  speaker,          bound, flags=re.IGNORECASE)
+        bound = re.sub(r"\bmy\b",  f"{speaker}'s",   bound, flags=re.IGNORECASE)
+        bound = re.sub(r"\bwe\b",  speaker,          bound, flags=re.IGNORECASE)
+        bound = re.sub(r"\bour\b", f"{speaker}'s",   bound, flags=re.IGNORECASE)
+        doc = nlp(bound)
+        for sent in doc.sents:
+            subj = verb = obj_text = None
+            for tok in sent:
+                if tok.dep_ in ("nsubj", "nsubjpass") and tok.pos_ != "PRON":
+                    subj = tok.text
+                if tok.dep_ == "ROOT" and tok.pos_ == "VERB":
+                    verb = tok.lemma_
+                if tok.dep_ in ("dobj", "attr") and verb and obj_text is None:
+                    obj_text = " ".join(
+                        t.text for t in tok.subtree if t.dep_ != "punct"
+                    )
+                elif tok.dep_ == "pobj" and verb and obj_text is None:
+                    obj_text = " ".join(
+                        t.text for t in tok.subtree if t.dep_ != "punct"
+                    )
+            if subj and verb and obj_text:
+                triple = f"{subj} {verb} {obj_text}"
+                word_count = len(triple.split())
+                if 3 <= word_count <= 15:
+                    facts.append(triple)
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    deduped = []
+    for f in facts:
+        key = f.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(f)
+    return deduped
 
 
 # ─── Database init ────────────────────────────────────────────────────────────
@@ -762,7 +846,7 @@ def store_turn_window(
     session_id: str,
     turns: list,
     current_index: int,
-    fact_type: str = "note",
+    fact_type: str = "window",
 ) -> "int | None":
     """Store a 3-turn sliding window centred on current_index as a single fact.
 
@@ -775,6 +859,10 @@ def store_turn_window(
     Semantic duplication across overlapping windows is intentional — different
     neighbouring context yields different embeddings and different retrieval matches.
 
+    Step 6: also extracts spaCy SVO atomic facts from each turn in the window
+    and stores them as separate note-type facts for higher-precision retrieval.
+    Windows themselves are tagged fact_type='window' and demoted in scoring.
+
     Returns the fact_id of the stored or enriched fact.
     """
     window: list[str] = []
@@ -783,7 +871,13 @@ def store_turn_window(
         tag = "[curr]" if i == current_index else ("[prev]" if i < current_index else "[next]")
         window.append(f"{tag} {turn['speaker']}: {turn['text']}")
     content = "\n".join(window)
-    return store_fact(project_id, session_id, content, fact_type, enrich=False)
+    # Store the window fact (demoted in retrieval scoring).
+    window_fid = store_fact(project_id, session_id, content, fact_type, enrich=False)
+    # Extract and store atomic SVO facts for higher-precision retrieval.
+    svo_facts = _extract_svo_facts(content)
+    for svo in svo_facts:
+        store_fact(project_id, session_id, svo, "note", enrich=True)
+    return window_fid
 
 
 def retrieve_facts(
@@ -1060,6 +1154,9 @@ def retrieve_facts(
         session_rec = _session_recency_score(fsid, session_id, session_idx_map)
         # Weights sum to 1.0. importance dropped — encoded in easiness_factor at insert time.
         score = 0.35 * rrf + 0.20 * recency + 0.20 * staleness + 0.15 * session_rec + 0.10 * freq
+        # Step 6: demote window facts so atomic SVO notes rank above them.
+        if ft == "window":
+            score *= _WINDOW_DEMOTION
         # (score, fid, content, ef, lra, rc)
         scored_all.append((score, fid, content, ef, lra, rc))
     scored_all.sort(reverse=True, key=lambda x: x[0])
