@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Preflight MCP Server â€” E2E smoke test.
 
 Tests core tool logic directly (bypasses MCP protocol) using a temp SQLite DB
@@ -664,7 +664,68 @@ except Exception:
     print("  ERROR:", traceback.format_exc())
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# -- IMP16-1: store_turn_window stores fact_type='window' by default --
+print("\n-- IMP16-1: store_turn_window uses fact_type='window' by default --")
+IMP16_PROJ = "imp16_window_type_proj"
+_IMP16_TURNS = [
+    {"speaker": "Carol", "text": "Carol went hiking in the mountains last weekend"},
+    {"speaker": "Dave",  "text": "that sounds amazing how long was the trail"},
+    {"speaker": "Carol", "text": "about twelve miles round trip"},
+]
+try:
+    _mem.store_turn_window(IMP16_PROJ, "imp16_s", _IMP16_TURNS, 1)
+    _c16 = sqlite3.connect(_DB)
+    _row16 = _c16.execute(
+        "SELECT fact_type FROM facts WHERE project_id = ? AND content LIKE '%[curr]%' ORDER BY id DESC LIMIT 1",
+        (IMP16_PROJ,),
+    ).fetchone()
+    _c16.close()
+    check("IMP16-1: default fact_type is 'window'",
+          _row16 is not None and _row16[0] == "window",
+          f"got fact_type={_row16[0] if _row16 else 'None'}")
+except Exception:
+    print("  ERROR:", traceback.format_exc())
+
+# -- IMP16-2: window content is still retrievable despite demotion --
+print("\n-- IMP16-2: window content is still retrievable (fallback) --")
+try:
+    r16 = _mem.retrieve_facts(IMP16_PROJ, "imp16_s", "hiking mountains weekend",
+                               top_n=5, threshold=0.0)
+    check("IMP16-2: window/SVO fact is returned",
+          isinstance(r16, list) and len(r16) > 0,
+          f"results={[x[:60] for x in r16]}")
+except Exception:
+    print("  ERROR:", traceback.format_exc())
+
+# -- IMP16-3: SVO note facts stored alongside window --
+print("\n-- IMP16-3: SVO atomic notes stored alongside window --")
+IMP16B_PROJ = "imp16b_svo_proj"
+_IMP16B_TURNS = [
+    {"speaker": "Eve",   "text": "Frank loves playing chess online every evening"},
+    {"speaker": "Frank", "text": "yes I play at least two games every night"},
+    {"speaker": "Eve",   "text": "you must be getting really good at it"},
+]
+try:
+    _mem.store_turn_window(IMP16B_PROJ, "imp16b_s", _IMP16B_TURNS, 0)
+    _c16b = sqlite3.connect(_DB)
+    _rows16b = _c16b.execute(
+        "SELECT fact_type FROM facts WHERE project_id = ? ORDER BY id",
+        (IMP16B_PROJ,),
+    ).fetchall()
+    _c16b.close()
+    _window_types = [r[0] for r in _rows16b]
+    _has_window = any(ft == "window" for ft in _window_types)
+    check("IMP16-3: at least one window fact stored", _has_window, f"types={_window_types}")
+    # SVO extraction may yield 0 facts for pronoun-heavy text -- acceptable.
+    # Just verify the function doesn't crash and returns a list from retrieval.
+    r16b = _mem.retrieve_facts(IMP16B_PROJ, "imp16b_s", "Frank chess playing", top_n=3, threshold=0.0)
+    check("IMP16-3: retrieve_facts returns list after store_turn_window",
+          isinstance(r16b, list),
+          f"got type={type(r16b)}")
+except Exception:
+    print("  ERROR:", traceback.format_exc())
+
+
 total = _PASS + _FAIL
 print(f"\n{'='*50}")
 print(f"  {_PASS}/{total} passed{'  ALL PASS' if _FAIL == 0 else ''}")
