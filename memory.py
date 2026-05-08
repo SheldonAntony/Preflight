@@ -1723,7 +1723,7 @@ if __name__ == "__main__":
         session_id    = sys.argv[3]
         turns         = json.loads(sys.argv[4])
         current_index = int(sys.argv[5])
-        fact_type     = sys.argv[6] if len(sys.argv) > 6 else "note"
+        fact_type     = sys.argv[6] if len(sys.argv) > 6 else "window"
         print(store_turn_window(project_id, session_id, turns, current_index, fact_type))
 
     elif cmd == "retrieve_facts":
