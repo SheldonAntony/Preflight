@@ -303,15 +303,19 @@ def build_dia_id_map(samples: list, db_path: str) -> dict:
             (pid,),
         ).fetchall()
         content_to_id: dict[str, int] = {}
+        # Two-pass: [prev]/[next] first (lower priority), then [curr] overwrites.
+        # This ensures every turn's "speaker: text" is mapped, even if it only
+        # appears as context in neighbouring window facts.
+        for priority_tags in (("[prev] ", "[next] "), ("[curr] ",)):
+            for fid, content in rows:
+                for line in content.split("\n"):
+                    for tag in priority_tags:
+                        if line.startswith(tag):
+                            content_to_id[line[len(tag):]] = fid
+        # Fallback for plain (non-window) facts stored without turn tags.
         for fid, content in rows:
-            # Facts stored via store_turn_window have a [curr] line; use that
-            # to map the current turn's "speaker: text" back to its fact ID.
-            for line in content.split("\n"):
-                if line.startswith("[curr] "):
-                    content_to_id[line[len("[curr] "):]] = fid
-                    break
-            else:
-                # Fallback: plain facts stored without turn-window tags.
+            if not any(content.startswith(t) or "\n" + t in content
+                       for t in ("[curr] ", "[prev] ", "[next] ")):
                 content_to_id[content] = fid
         pid_map: dict[int, int] = {}
         conv = sample.get("conversation", {})
