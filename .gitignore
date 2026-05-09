@@ -1,0 +1,17 @@
+# Benchmark DBs and WAL/SHM sidecars
+locomo_eval_*.db
+locomo_eval_*.db-wal
+locomo_eval_*.db-shm
+
+# Benchmark results (machine-generated, large)
+locomo_results.json
+locomo_recall_results.json
+
+# Temporary diagnostic scripts
+analyze_failures.py
+diagnose_misses.py
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo

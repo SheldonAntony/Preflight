@@ -32,8 +32,12 @@ def _cos(a: list[float], b: list[float]) -> float:
     nb  = sum(x * x for x in b) ** 0.5
     return dot / (na * nb) if na and nb else 0.0
 
+def _embed_batch(texts: list) -> list:
+    return [_embed(t) for t in texts]
+
 _stub_utils.embed_text = _embed
 _stub_utils.cosine_similarity = _cos
+_stub_utils.embed_texts_batch = _embed_batch
 sys.modules["utils"] = _stub_utils
 
 # â”€â”€ Add backend scripts dir to path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
