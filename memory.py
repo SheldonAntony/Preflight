@@ -35,6 +35,11 @@ except ImportError:
 # Feature 1 Bug 3: shared utilities extracted from this module
 from utils import cosine_similarity, embed_text, embed_texts_batch
 
+# LLM atomic fact extractor (Qwen2.5-1.5B via Ollama) — opt-in via env flag.
+# Requires: ollama pull qwen2.5:1.5b  and Ollama running on localhost:11434.
+# Silently no-ops when Ollama is not available; raw storage is never affected.
+_USE_LLM_EXTRACTOR = os.environ.get("PREFLIGHT_USE_LLM_EXTRACTOR", "0") == "1"
+
 try:
     from extractor import extract_entities as _extract_entities
 except (ImportError, AttributeError):
@@ -54,6 +59,7 @@ _DECAY_RATES: dict[str, float] = {
     "note":       0.02,    # default — generic notes
     "window":     0.03,    # sliding-window turns — fast decay, demoted in scoring
     "turn":       0.03,    # single-turn facts (clean [curr] text) — same decay as window
+    "llm_atomic": 0.005,   # LLM-extracted atomic facts — slow decay like findings
 }
 
 # Similarity threshold above which a new fact is treated as a contradiction
@@ -78,6 +84,7 @@ _IMPORTANCE_TYPE_WEIGHTS: dict[str, float] = {
     "snippet": 0.5, "summary": 0.4, "note": 0.3,
     "turn": 0.25,      # single-turn facts — slightly above window, below general notes
     "window": 0.05,    # window facts rank below atomic notes by default
+    "llm_atomic": 0.65, # LLM-extracted atomic facts — high signal, between finding and note
 }
 _IMPORTANCE_KEYWORDS: frozenset = frozenset({
     "never", "always", "must", "critical", "required", "forbidden",
@@ -103,7 +110,8 @@ _WINDOW_DEMOTION = 0.55
 _SM2_GATE_ENABLED = False
 
 # ── Tunable retrieval constants ───────────────────────────────────────────────
-_POOL_A_LIMIT          = 750    # most-recent facts (recency pool) — raised from 200
+# PREFLIGHT_POOL_A overrides at runtime — useful for ablations without code changes.
+_POOL_A_LIMIT          = int(os.environ.get("PREFLIGHT_POOL_A", "750"))   # most-recent facts pool
 _POOL_B_LIMIT          = 300    # proven-useful facts (retrieval_count > 0)
 _TEMPORAL_EDGE_DECAY   = 0.25   # strength decay per turn distance (linear)
 _TEMPORAL_MAX_DISTANCE = 3      # turns back to link temporally
@@ -116,6 +124,18 @@ _ENRICH_MIN_SIM        = 0.15   # minimum cosine similarity to existing fact bef
 _RETRO_FLOOR  = 0.35   # minimum pairwise cosine to trigger a merge
 _RETRO_GUARD  = 0.30   # merged embedding must be >= this to BOTH originals (prevents chaining)
 _RETRO_MAX    = 500    # default merge cap per consolidate_memories() call
+
+# BM25 stopwords: question-frame and common function words that match many
+# irrelevant turns and inflate BM25 ranks for wrong facts.  Filtering them
+# prevents noisy BM25 matches from overriding strong vector hits in RRF fusion.
+_BM25_STOPWORDS = frozenset({
+    "what", "when", "where", "which", "who", "whom", "whose", "how", "why",
+    "did", "does", "has", "had", "was", "were", "are", "been", "have",
+    "would", "could", "should", "will", "shall",
+    "the", "that", "this", "and", "for", "with", "from", "into",
+    "she", "her", "his", "their", "him", "they", "you", "its",
+    "not", "but", "can", "any", "all", "out",
+})
 
 
 # ── Embedding cache for ANN-based Pool A ─────────────────────────────────────
@@ -141,6 +161,165 @@ def _get_nlp():
         except Exception:
             _nlp = False
     return _nlp if _nlp is not False else None
+
+
+# ── Derived FTS helpers ────────────────────────────────────────────────────────
+
+_WORDNET_AVAILABLE: "bool | None" = None  # None=untested, True/False=cached
+
+# Common question/function words that should never be expanded via WordNet.
+# Expanding these produces domain-wrong hypernyms (e.g. "does"→"do"→verb chain,
+# "play"→many verb senses) that create spurious BM25 hits and hurt R@40.
+_EXPAND_STOP_WORDS: frozenset = frozenset({
+    "what", "when", "where", "which", "whom", "whose",
+    "does", "this", "that", "these", "those", "have", "been",
+    "will", "would", "could", "should", "with", "from", "into",
+    "about", "after", "before", "between", "through", "during",
+    "their", "there", "they", "them", "then", "than", "also",
+    "just", "some", "many", "much", "more", "most", "other",
+    "over", "under", "again", "further", "once", "here",
+    "both", "each", "such", "were", "very", "while", "said",
+    "like", "know", "think", "want", "going", "come", "came",
+    "make", "made", "take", "took", "give", "gave", "tell",
+    "told", "well", "time", "year", "back", "even", "good",
+    "work", "life", "feel", "felt", "long", "been", "last",
+    "still", "never", "always", "really", "actually", "maybe",
+    "probably", "something", "anything", "everything", "nothing",
+    "someone", "anyone", "everyone", "thing", "things",
+    # Temporal / conversational words whose noun senses expand to useless concepts
+    "yeah", "okay", "today", "tonight", "yesterday", "tomorrow",
+    "morning", "evening", "afternoon", "night", "weekend", "recently",
+    "group", "support", "place", "people", "person", "point", "kind",
+})
+
+
+def _build_derived_text(text: str) -> str:
+    """Return a bag-of-words string expanding noun tokens with WordNet depth-1 hypernyms.
+
+    Uses noun-only expansion to avoid verb-sense pollution (e.g. "instrument"
+    as a verb → "equip", "fit out" which are domain-wrong for music queries).
+    Noun hypernyms are the reliable signal: guitar→stringed_instrument,
+    marathon→foot_race, painting→creation.
+
+    Polysemy guard: nouns with >4 synsets are left unexpanded.
+    Multi-word hypernym lemmas (e.g. "stringed_instrument") are kept as a
+    single token (underscore removed, space-joined) — they appear as separate
+    terms in FTS which is correct.  Single short words from compound lemmas
+    (e.g. "out" from "fit_out") are filtered by the >3 char threshold.
+
+    Falls back gracefully: if NLTK/WordNet is unavailable, returns the text
+    lowercased (still useful for FTS case-normalisation).
+
+    Speaker prefix ("Alex: ") is preserved verbatim and not expanded.
+    """
+    global _WORDNET_AVAILABLE
+
+    # Preserve speaker prefix; expand body only.
+    if ": " in text:
+        speaker, _, body = text.partition(": ")
+    else:
+        speaker, body = "", text
+
+    # Tokenise body: strip punctuation, lowercase, drop short/numeric tokens.
+    raw_tokens = [t.strip(".,!?\"'():;-") for t in body.split()]
+    tokens = [t.lower() for t in raw_tokens if len(t) > 3 and not t.isdigit()]
+
+    if not tokens:
+        return text.lower()
+
+    # One-time WordNet availability check.
+    if _WORDNET_AVAILABLE is None:
+        try:
+            from nltk.corpus import wordnet as _wn  # noqa: PLC0415
+            _wn.synsets("test")
+            _WORDNET_AVAILABLE = True
+        except LookupError:
+            try:
+                import nltk  # noqa: PLC0415
+                nltk.download("wordnet", quiet=True)
+                nltk.download("omw-1.4", quiet=True)
+                from nltk.corpus import wordnet as _wn  # noqa: PLC0415
+                _wn.synsets("test")
+                _WORDNET_AVAILABLE = True
+            except Exception:
+                _WORDNET_AVAILABLE = False
+        except ImportError:
+            _WORDNET_AVAILABLE = False
+
+    if not _WORDNET_AVAILABLE:
+        parts = ([speaker] if speaker else []) + tokens
+        return " ".join(parts)
+
+    from nltk.corpus import wordnet as wn        # noqa: PLC0415
+    from nltk.stem import WordNetLemmatizer      # noqa: PLC0415
+
+    lem = WordNetLemmatizer()
+    seen: set[str] = set(tokens)
+    expansions: list[str] = []
+
+    for tok in tokens:
+        # Skip function/question words — their hypernyms are always off-topic.
+        if tok in _EXPAND_STOP_WORDS:
+            continue
+
+        # Noun-only expansion.  Verb expansions produce domain-wrong terms
+        # for words that are primarily nouns (e.g. "instrument"→"equip").
+        noun_lemma = lem.lemmatize(tok, pos="n")
+        synsets = wn.synsets(noun_lemma, pos=wn.NOUN)
+        if not synsets or len(synsets) > 4:
+            continue  # absent or too polysemous
+
+        added = 0
+        for hyp in synsets[0].hypernyms():
+            # Skip hypernyms too close to the WordNet root — those are abstract
+            # concepts like "abstraction", "entity", "physical_object" which are
+            # never useful FTS expansion terms.  Depth ≥ 5 keeps domain-specific
+            # terms (stringed_instrument ≈ 7, foot_race ≈ 6) while blocking
+            # root abstractions (depth 1-3).
+            try:
+                if hyp.min_depth() < 5:
+                    continue
+            except Exception:
+                pass
+            for ln in hyp.lemma_names():
+                # Replace underscores so "stringed_instrument" → "stringed instrument"
+                # which FTS5 indexes as two terms — both are useful query tokens.
+                clean = ln.replace("_", " ").lower()
+                # Filter individual short words that arise from compound lemmas
+                # like "fit_out" → "fit out" → "fit"(3) would be noise.
+                # Apply min-length check to each word in the expansion phrase.
+                if any(len(w) <= 3 for w in clean.split()):
+                    continue
+                if clean not in seen:
+                    expansions.append(clean)
+                    seen.add(clean)
+                    added += 1
+                    if added >= 3:
+                        break
+            if added >= 3:
+                break
+
+    parts = ([speaker] if speaker else []) + tokens + expansions
+    return " ".join(parts)
+
+
+def _store_derived_fts(fid: int, curr_line: str) -> None:
+    """Insert/replace derived expansion text for *fid* into facts_derived_fts.
+
+    Silently swallows all errors so the store path is never broken by a
+    missing NLTK corpus or any other optional-dependency failure.
+    """
+    try:
+        derived = _build_derived_text(curr_line)
+        conn = init_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO facts_derived_fts(rowid, content) VALUES (?, ?)",
+            (fid, derived),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def _extract_svo_facts(window_content: str) -> list[str]:
@@ -281,6 +460,14 @@ def init_db() -> sqlite3.Connection:
             content='facts',
             content_rowid='id'
         )
+    """)
+
+    # Derived FTS: lemmatized + WordNet-expanded text for vocabulary bridging.
+    # Regular FTS (not external-content) — rowid = facts.id of the window fact.
+    # Populated at store time by _store_derived_fts(); enables BM25 hits on
+    # paraphrased/hypernym terms that raw conversational text lacks.
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS facts_derived_fts USING fts5(content)
     """)
 
     # Feature 2: migrations — add project_id if the table already exists
@@ -579,7 +766,8 @@ def _get_cross_encoder():
 def store_fact(project_id: str, session_id: str, text: str,
                fact_type: str = "note", enrich: bool = True,
                _embed_text: "str | None" = None,
-               _precomputed_emb: "list[float] | None" = None) -> "int | None":
+               _precomputed_emb: "list[float] | None" = None,
+               _source_hash: "str | None" = None) -> "int | None":
     """Store a fact with soft-expire on contradiction, binary embedding, entity extraction.
 
     Contradiction detection: cosine similarity >= _CONTRADICTION_THRESHOLD writes a
@@ -619,7 +807,7 @@ def store_fact(project_id: str, session_id: str, text: str,
     # skip the scan for turn facts too.
     best_id: int | None = None
     best_sim: float = 0.0
-    if fact_type not in ("window", "turn"):
+    if fact_type not in ("window", "turn", "llm_atomic"):
         cursor = conn.execute(
             """SELECT id, embedding FROM facts
                WHERE project_id = ?
@@ -637,13 +825,13 @@ def store_fact(project_id: str, session_id: str, text: str,
                 best_sim = sim
                 best_id = row_id
 
-    source_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+    source_hash = _source_hash if _source_hash is not None else hashlib.sha256(text.encode()).hexdigest()[:16]
     # Skip spaCy NER for window/turn rows — conversational turns contain mostly
     # speaker names (low discriminability) and the call costs ~0.5s each.
     # Window rows store blended 3-turn text; entity overlap signal is noisy.
     # Turn rows are identical speaker:text — entities are subset of window row.
     # fact_type='note'/'finding'/'decision' etc. still get full entity extraction.
-    entities = [] if fact_type in ("window", "turn") else _extract_entities(text)
+    entities = [] if fact_type in ("window", "turn", "llm_atomic") else _extract_entities(text)
     ents_json = json.dumps(entities)
     emb_blob = _encode_embedding(emb)
     # Phase A: importance scoring
@@ -792,7 +980,9 @@ def store_fact(project_id: str, session_id: str, text: str,
     # adjacent turns hit _RELATION_THRESHOLD for every neighbour (cosine ~0.8+)
     # producing O(n²) inserts into fact_relations. The graph is not consulted
     # by retrieve_facts for these row types anyway (pure cosine ANN).
-    if fact_type not in ("window", "turn"):
+    # Also skip for llm_atomic: large volume of short facts would produce
+    # excessive O(n²) edges and adds no retrieval signal during bulk ingestion.
+    if fact_type not in ("window", "turn", "llm_atomic"):
         link_cursor = conn.execute(
             """SELECT id, content, embedding FROM facts
                WHERE project_id = ? AND id != ?
@@ -821,7 +1011,8 @@ def store_fact(project_id: str, session_id: str, text: str,
     # Bridges conversationally adjacent facts that may be semantically unrelated.
     # Also skip for window/turn rows — temporal links between adjacent turns are
     # already implicit in the sliding window structure; the graph adds no signal.
-    if fact_type not in ("window", "turn"):
+    # Also skip for llm_atomic — same reasoning; avoids O(n²) edges in bulk.
+    if fact_type not in ("window", "turn", "llm_atomic"):
         temporal_neighbors = conn.execute(
             """SELECT id FROM facts
                WHERE project_id = ? AND session_id = ? AND id != ?
@@ -857,7 +1048,7 @@ def _fts5_query(prompt: str) -> str:
     keyword can match. Returns empty string when no usable tokens remain.
     """
     safe = "".join(c if c.isalnum() or c.isspace() else " " for c in prompt)
-    tokens = [t for t in safe.split() if len(t) > 2]
+    tokens = [t for t in safe.split() if len(t) > 2 and t.lower() not in _BM25_STOPWORDS]
     if not tokens:
         return ""
     # Quote each token to avoid FTS5 keyword collisions (AND/OR/NOT/NEAR).
@@ -897,6 +1088,8 @@ def store_turn_window(
     current_index: int,
     fact_type: str = "window",
     extract_svo: bool = True,
+    store_turn: bool = True,
+    _precomputed_curr_emb: "list[float] | None" = None,
 ) -> "int | None":
     """Store a 3-turn sliding window centred on current_index as a single fact.
 
@@ -918,6 +1111,14 @@ def store_turn_window(
     bulk benchmark ingestion — conversational text yields <1% SVO triples but
     the spaCy calls dominate ingestion time (~0.5s each × 5882 turns = 3200s).
 
+    store_turn: when False, skip the companion clean-turn row.  During benchmark
+    ingestion with mode B the window row already provides ANN recall; the turn
+    row adds a second embed call that is redundant.  Defaults to True so that
+    production and test behaviour are unchanged.
+
+    _precomputed_curr_emb: optional pre-computed embedding for curr_line (from
+    caller's batch embed pass).  Skips one embed_text() call per turn.
+
     Returns the fact_id of the stored or enriched fact.
     """
     window: list[str] = []
@@ -934,17 +1135,54 @@ def store_turn_window(
     # match the question against the specific turn that contains the answer.
     # Embedding the full [prev][curr][next] blends three speakers' text into one
     # vector and degrades recall (validated: R@40 unchanged, F1 drops).
-    window_emb = embed_text(curr_line) if curr_line else embed_text(content)
-    turn_emb   = window_emb
+    # Accept a pre-computed embedding from a batch pass (benchmark ingest speed).
+    window_emb = (
+        _precomputed_curr_emb
+        if _precomputed_curr_emb is not None
+        else (embed_text(curr_line) if curr_line else embed_text(content))
+    )
+    turn_emb = window_emb
     # Store the clean single-turn fact FIRST (fact_type="turn") so it gets a lower
     # row id than the window row.  Tests that fetch ORDER BY id DESC LIMIT 1 will
     # get the window row (richer context); retrieval can return either row.
-    if curr_line:
+    # store_turn=False skips this during benchmark ingestion (window row is sufficient).
+    if curr_line and store_turn:
         store_fact(project_id, session_id, curr_line, "turn", enrich=False,
                    _precomputed_emb=turn_emb)
     # Window row stored second — last inserted, richer 3-turn context for display.
     window_fid = store_fact(project_id, session_id, content, fact_type, enrich=False,
                             _precomputed_emb=window_emb)
+    # Populate derived FTS: lemmatized + WordNet-expanded text for the [curr] turn.
+    # Bridges vocab gap between conversational text and information-seeking queries.
+    if window_fid and curr_line:
+        _store_derived_fts(window_fid, curr_line)
+    # LLM atomic fact extraction (opt-in via PREFLIGHT_USE_LLM_EXTRACTOR=1).
+    # Requires Ollama running locally with qwen2.5:1.5b pulled.
+    # Each extracted fact is stored with the turn's content hash as source_hash
+    # so build_dia_id_map can link llm_atomic fids back to their source dia_id.
+    # Silently skips (never raises) if Ollama is unavailable.
+    # Run in a daemon thread so live MCP calls are not blocked waiting for Ollama.
+    # For batch ingestion (recall_ablation --reingest) this is also safe: the
+    # outer loop stays alive until all turns are processed, giving threads time
+    # to complete; eval queries happen only after the loop exits.
+    if _USE_LLM_EXTRACTOR and curr_line:
+        import threading as _threading  # noqa: PLC0415
+
+        def _run_llm_extract(_cl=curr_line, _pid=project_id, _sid=session_id):
+            try:
+                from llm_extractor import extract_atomic_facts as _llm_extract  # noqa: PLC0415
+                _turn_hash = hashlib.sha256(_cl.encode()).hexdigest()[:16]
+                for _fact_text in _llm_extract(_cl):
+                    _fact_emb = embed_text(_fact_text)
+                    store_fact(
+                        _pid, _sid, _fact_text, "llm_atomic",
+                        enrich=False, _precomputed_emb=_fact_emb,
+                        _source_hash=_turn_hash,
+                    )
+            except Exception:
+                pass  # never let extractor errors affect raw storage
+
+        _threading.Thread(target=_run_llm_extract, daemon=True).start()
     # Extract and store atomic SVO facts for higher-precision retrieval.
     # Skip during bulk ingestion (extract_svo=False) — spaCy is ~0.5s/window.
     if extract_svo:
