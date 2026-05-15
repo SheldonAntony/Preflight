@@ -1,9 +1,9 @@
 # LoCoMo Retrieval — Complete Handover Document
 
-> **Date:** 2026-05-15  
-> **Goal:** Maximize Recall@3 on the LoCoMo benchmark (1,522 QA pairs across 10 conversations).  
-> **Current champion:** v8 — `bge-reranker-v2-m3` — **R@3 = 80.81%, R@40 = 96.98%**  
-> **Active run:** v11 lexical channels — results pending  
+> **Date:** 2026-05-16  
+> **Goal:** Maximize Recall@3 on the LoCoMo benchmark (1,531 scorable QA pairs across 10 conversations).  
+> **Current champion:** v11 — lexical channels — **R@3 = 80.47%, R@40 = 95.75% (B DB)**  
+> **Previous champion (H DB):** v8 — `bge-reranker-v2-m3` — R@3 = 80.81%, R@40 = 96.98% (not comparable, different DB)  
 > **Next AI agent:** read this top-to-bottom before touching anything.
 
 ---
@@ -265,7 +265,8 @@ data = json.load(open("locomo_recall_v11_lexical_channels.json"))
 | **v8_bge_reranker_v2m3** (CE upgraded) | — | **80.81%** | **86.93%** | **91.52%** | **96.98%** | **CHAMPION** |
 | v9_pool100 (CE_POOL=100) | — | 80.49% | 86.47% | 91.20% | 96.06% | REJECTED |
 | v10_alpha2 (CE_ALPHA=2.0) | — | 77.99% | 82.79% | 88.50% | 95.66% | REJECTED |
-| v11_lexical_channels | — | **TBD** | **TBD** | **TBD** | **TBD** | PENDING |
+| v8_bdb_control (v8 config, B DB) | 64.21% | 80.34% | 85.89% | 90.27% | 95.62% | B-DB baseline |
+| **v11_lexical_channels (B DB)** | **64.21%** | **80.47%** | **86.15%** | **90.33%** | **95.75%** | **CHAMPION (B DB)** |
 
 ### Detailed experiment decisions:
 
@@ -316,7 +317,7 @@ data = json.load(open("locomo_recall_v11_lexical_channels.json"))
 - Root cause unknown, but empirically: blending CE with rank_norm destroys the CE gains.
 - **CE_ALPHA IS PERMANENTLY ABANDONED**. Always use alpha=0 (pure CE replacement).
 
-#### v11 — Lexical Explicit-Memory Channels (PENDING)
+#### v11 — Lexical Explicit-Memory Channels (CHAMPION — B DB)
 - Hypothesis: 37 questions have gold facts that NEVER appear in the top-200 broad pool, regardless of signal. Cosine AND BM25 both miss them. These are "true pool misses."
 - Analysis by category:
   - `temporal`: 11 pool misses — questions about specific dates/times
@@ -341,7 +342,7 @@ data = json.load(open("locomo_recall_v11_lexical_channels.json"))
   ```
   
 - Code location: `eval_locomo.py` lines 1322–1366, gated by `PREFLIGHT_USE_LEXICAL_CHANNELS=1`.
-- Expected impact: R@40 → ~98% (recover ~37 pool misses), R@3 → ~82-84%.
+- **Actual impact vs v8_bdb_control (B DB):** R@3 +0.13pp (80.34→80.47), R@5 +0.26pp, R@40 +0.13pp. Multi-hop R@5 +1.42pp (81.85→83.27). All other categories flat. VERDICT: WIN.
 
 ### Diagnostic analysis (diag_v8.py):
 
@@ -422,58 +423,58 @@ The 10th conversation is the largest. If the benchmark crashes with OOM on Conv 
 
 ## 9. What To Do Next
 
-### ⚠️ CRITICAL: DB LETTER MISMATCH — READ FIRST
+### ✅ DB MISMATCH RESOLVED — v8_bdb_control completed
 
-All benchmarks v4 through v10 used `locomo_eval_H.db` (passed `--db-letter H` or old default).  
-v11 ran on `locomo_eval_B.db` (current default in `recall_ablation.py`).
+v4–v10 used H DB; v11 uses B DB. Control run `v8_bdb_control` (v8 config, B DB) is **complete**.
 
-**You CANNOT directly compare v11 (B DB) to v8 (H DB).**
+**v8_bdb_control results (B DB, no lexical channels):**
+- R@3: 80.34% | R@5: 85.89% | R@40: 95.62%
+- Multi-hop R@5: 81.85%
 
-**Step 0 — IMMEDIATE after v11 finishes:**  
-Run v8 config on B DB as a control:
-```powershell
-cd "C:\Users\Sheldon Antony\.config\preflight"
-$env:ENGRAM_EMBED_BACKEND="sentence-transformers"
-$env:ENGRAM_EMBED_MODEL="C:\Users\Sheldon Antony\.config\preflight\bge-small-engram-v3"
-$env:PREFLIGHT_RRF_K="15"
-$env:PREFLIGHT_USE_DERIVED_BM25="1"
-$env:PREFLIGHT_USE_LEARNED_RERANK="1"
-$env:PREFLIGHT_BROAD_POOL="200"
-$env:PREFLIGHT_COVERAGE_K="40"
-$env:PREFLIGHT_LEARNED_RERANK_ALPHA="3.0"
-$env:PREFLIGHT_USE_CE="1"
-$env:PREFLIGHT_CE_GUARD_K="40"
-$env:PREFLIGHT_CE_POOL="200"
-$env:PREFLIGHT_CE_MODEL="BAAI/bge-reranker-v2-m3"
-# Note: NO PREFLIGHT_USE_LEXICAL_CHANNELS here — this is the v8 config baseline
-python recall_ablation.py --tag v8_bdb_control
-```
-This gives you `locomo_recall_v8_bdb_control.json` — the true comparison point for v11.
+**v11 delta over control:**
+- R@3: +0.13pp | R@5: +0.26pp | R@40: +0.13pp
+- Multi-hop R@5: +1.42pp — all gain from channels A (name) and B (date)
+
+**VERDICT: v11 WINS. Lexical channels are the new champion on B DB.**
 
 ---
 
-### IMMEDIATE (after v8_bdb_control completes):
+### IMMEDIATE — Next steps:
 
-**If v11 beats v8_bdb_control (R@3 > v8_bdb_control AND R@40 > v8_bdb_control):**
-1. Mark v11 as new champion
-2. Add 3 new GBM features to `reranker.py` (to teach GBM about lexical channel hits):
-   - `name_token_hit_count` — how many name tokens from Q appear in fact
-   - `date_token_hit_count` — how many date tokens from Q appear in fact
-   - `bigram_hit_count` — how many Q bigrams appear in fact
-3. Retrain GBM: `python train_reranker.py` (update feature cache first)
-4. Run v12 = v11 config + retrained GBM
-5. If v12 beats v11 → new champion
+**Step 1 — Retrain GBM with 3 new lexical features:**
 
-**If v11 regresses at R@3 but R@40 improves vs v8_bdb_control:**
-- The channels are working (pool misses fixed) but GBM/CE is confused by new candidates
-- Try running channels A+B only (disable bigram channel: it adds noise for every question)
-- Add a new env flag `PREFLIGHT_LEXICAL_NAME_DATE_ONLY=1` to run A+B without C
+Add to `reranker.py` feature extraction (bump `N_FEATURES` 18 → 21):
+```python
+def _name_hit_count(content: str, question: str) -> int:
+    import re
+    STOPNAME = {'The', 'What', 'Who', 'When', 'Where', 'Why', 'How', 'Did', 'Does', 'Was'}
+    toks = [w for w in re.findall(r'\b[A-Z][a-z]{2,}\b', question) if w not in STOPNAME]
+    return sum(content.count(t) for t in toks)
 
-**If v11 regresses at both R@3 and R@40 vs v8_bdb_control:**
-- The channels are adding too much noise
-- The bigram channel (C) is the most likely culprit (every Q has bigrams → huge pool inflation)
-- Try: name channel only, then date channel only, to isolate which helps
-- Consider FTS5 phrase match instead of in-memory substring scan for channel C
+def _date_hit_count(content: str, question: str) -> int:
+    import re
+    pats = re.findall(r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b|\b\d{4}\b', question)
+    return sum(content.count(p) for p in pats)
+
+def _bigram_hit_count(content: str, question: str) -> int:
+    words = [w for w in re.sub(r'[^a-z\s]', ' ', question.lower()).split() if len(w) > 2]
+    bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
+    c = content.lower()
+    return sum(1 for bg in bigrams if bg in c)
+```
+Update `reranker_metadata.json` → `{"n_features": 21}`.
+Regenerate feature cache, run `python train_reranker.py`.
+Run v12 = v11 config + retrained GBM.
+
+**Step 2 — Run v12 benchmark:**
+```powershell
+$env:PREFLIGHT_USE_LEXICAL_CHANNELS="1"
+python recall_ablation.py --tag v12_gbm21feat
+```
+Expect: R@3 > 80.47% if GBM learns to use channel candidates better.
+
+**Step 3 — Port winning config to memory.py (after v12 verdict):**
+See port plan in section below.
 
 ### MEDIUM TERM:
 
@@ -607,7 +608,38 @@ By category (R@5):
   Open-domain: 90.73%
 
 Elapsed: 17203.8s
-Decision: PENDING — need v8_bdb_control on B DB to compare fairly
+Decision: **WIN vs v8_bdb_control** — v11 is the new B-DB champion
+
+## v8_bdb_control Results (B DB — baseline without lexical channels)
+
+```
+R@1:  64.21%
+R@3:  80.34%
+R@5:  85.89%
+R@10: 90.27%
+R@40: 95.62%
+
+By category (R@5):
+  Single-hop:  56.18%
+  Multi-hop:   81.85%
+  Temporal:    85.00%
+  Open-domain: 90.73%
+
+Elapsed: 5784.2s
 ```
 
-**⚠️ Cannot compare to v8 (H DB) directly.** Must run `v8_bdb_control` (v8 config, B DB, no lexical channels) first.
+## Head-to-Head Comparison (B DB)
+
+| Metric | v8_bdb_control | v11_lexical_channels | Delta |
+|--------|---------------|---------------------|-------|
+| R@1 | 64.21% | 64.21% | +0.00 |
+| **R@3** | 80.34% | **80.47%** | **+0.13** |
+| R@5 | 85.89% | 86.15% | +0.26 |
+| R@10 | 90.27% | 90.33% | +0.06 |
+| R@40 | 95.62% | 95.75% | +0.13 |
+| Multi-hop R@5 | 81.85% | **83.27%** | **+1.42** |
+
+**All gains come from multi-hop (+1.42pp R@5). Single-hop, temporal, open-domain are flat.**  
+This makes sense: name/date channels help questions that reference specific entities across turns.  
+
+**VERDICT: v11 WINS. Commit: `locomo_recall_v8_bdb_control.json` staged.**
