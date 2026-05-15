@@ -59,6 +59,61 @@ _USE_EVAL_SPEAKER_BOOST = os.environ.get("PREFLIGHT_SPEAKER_BOOST",    "0") == "
 _RRF_K                  = int(os.environ.get("PREFLIGHT_RRF_K",         "60"))
 _USE_DERIVED_BM25       = os.environ.get("PREFLIGHT_USE_DERIVED_BM25", "0") == "1"
 _POOL_A_SIZE            = int(os.environ.get("PREFLIGHT_POOL_A",        "750"))
+_USE_LLM_ATOMIC_RERANK  = os.environ.get("PREFLIGHT_USE_LLM_ATOMIC_RERANK", "0") == "1"
+_LLM_ATOMIC_ALPHA       = float(os.environ.get("PREFLIGHT_LLM_ATOMIC_ALPHA", "0.10"))
+# score_mode: how to aggregate per-window atomic cosine similarities.
+#   max   — highest cosine among all sibling atomic facts (current default)
+#   top2  — max + 0.5 * second_best  (rewards windows with multiple hits)
+#   rrf   — rank by best atomic cosine, combine with original RRF rank
+_LLM_ATOMIC_SCORE_MODE  = os.environ.get("PREFLIGHT_LLM_ATOMIC_SCORE", "max")  # max|top2|rrf
+# pool_size: how many top RRF windows to rerank (tail is left untouched)
+_LLM_ATOMIC_POOL        = int(os.environ.get("PREFLIGHT_LLM_ATOMIC_POOL", "40"))
+
+# Learned feature reranker (trained by train_reranker.py).
+# When enabled, replaces the tail sort of the RRF list with a logistic
+# regression model that combines cos/BM25/derived/atomic signals.
+_USE_LEARNED_RERANK     = os.environ.get("PREFLIGHT_USE_LEARNED_RERANK",  "0") == "1"
+_LEARNED_RERANK_POOL    = int(os.environ.get("PREFLIGHT_LEARNED_RERANK_POOL", "80"))
+_LEARNED_RERANK_ATOMIC  = os.environ.get("PREFLIGHT_LEARNED_RERANK_ATOMIC", "0") == "1"
+# alpha=0: pure probability sort.  alpha>0: soft blend (rrf_norm + alpha*prob).
+# A value of ~3.0 keeps RRF ordering mostly intact while nudging top items.
+_LEARNED_RERANK_ALPHA   = float(os.environ.get("PREFLIGHT_LEARNED_RERANK_ALPHA", "0.0"))
+
+# Broad candidate pool: instead of ranking all facts via RRF then reranking
+# the top-N, first gather a union of top-N from each retrieval signal, then
+# run RRF+reranker on this focused pool. Dramatically improves R@40 by
+# ensuring facts strong in any ONE signal are visible to the reranker.
+# Set to e.g. 200 to take top-200 from cos + bm25 + derived before RRF.
+_BROAD_POOL         = int(os.environ.get("PREFLIGHT_BROAD_POOL", "0"))
+
+# Lexical explicit-memory channels: inject three targeted candidate channels
+# into the broad pool before RRF/GBM reranking:
+#   A) Person-name: facts containing capitalised name tokens from the question.
+#   B) Date/year:   facts containing year or month-year patterns from the question.
+#   C) Key-bigram:  facts containing important adjacent word pairs from the question.
+# These channels target the ~37 true pool misses where cosine+BM25 both fail.
+_USE_LEXICAL_CHANNELS = os.environ.get("PREFLIGHT_USE_LEXICAL_CHANNELS", "0") == "1"
+
+# Coverage protection: after reranking, apply min-rank ensemble of reranker
+# and RRF orderings so R@K cannot fall below the RRF baseline.
+# Set to the K you want to protect (e.g. 40 for R@40 protection).
+_COVERAGE_PROTECT_K = int(os.environ.get("PREFLIGHT_COVERAGE_K", "0"))
+
+# CE blend alpha: 0 = CE replaces top-100 order entirely (original);
+# >0 = blend CE score with GBM rank: final_score = rank_norm + alpha * ce_sigmoid.
+# Suggested: 2.0–5.0. Prevents CE from completely overriding GBM order.
+_CE_ALPHA           = float(os.environ.get("PREFLIGHT_CE_ALPHA", "0.0"))
+
+# CE coverage guard: after CE rerank, apply min-rank ensemble of CE rank and
+# pre-CE rank so items in top-K before CE cannot fall below rank K after CE.
+# Set to the K you want to protect (e.g. 40 for R@40 protection).
+# 0 = disabled (default: off — CE replacement is unconstrained).
+_CE_GUARD_K         = int(os.environ.get("PREFLIGHT_CE_GUARD_K", "0"))
+
+# CE pool size: number of candidates fed to the cross-encoder.
+# Larger pool lets CE see candidates ranked 101-200 by GBM (costs extra time).
+# Default 100 (original). Set to 200 to extend CE coverage to GBM rank 101-200.
+_CE_POOL_SIZE       = int(os.environ.get("PREFLIGHT_CE_POOL", "100"))
 
 # ── Embedding setup: try real fastembed; fall back to SHA-256 stub ─────────────
 # Must happen BEFORE importing memory so memory.py picks up the right utils.
@@ -858,6 +913,248 @@ def run_mode(samples: list, mem, mode: str) -> tuple[dict, dict]:
     return stats, results
 
 
+# ── Lazy-loaded learned reranker ─────────────────────────────────────────────
+_LEARNED_MODEL  = None
+_LEARNED_SCALER = None
+_LEARNED_LOADED = False
+
+
+def _get_learned_model():
+    """Load (model, scaler) from disk once; return (None, None) if unavailable."""
+    global _LEARNED_MODEL, _LEARNED_SCALER, _LEARNED_LOADED
+    if _LEARNED_LOADED:
+        return _LEARNED_MODEL, _LEARNED_SCALER
+    _LEARNED_LOADED = True
+    try:
+        import reranker as _rr  # noqa: PLC0415
+        _LEARNED_MODEL, _LEARNED_SCALER = _rr.load_model(_PREFLIGHT_DIR)
+        if _LEARNED_MODEL is not None:
+            print(f"  [reranker] Loaded learned model from {_PREFLIGHT_DIR}")
+        else:
+            print("  [reranker] WARNING: model file not found — run train_reranker.py first")
+    except Exception as exc:
+        print(f"  [reranker] Could not load model: {exc}")
+    return _LEARNED_MODEL, _LEARNED_SCALER
+
+
+def _apply_learned_rerank(
+    conn, pid: str, q_emb: list,
+    sorted_ids: list,
+    rrf_scores: dict,
+    cos_ranks: dict,
+    cos_sims: dict,
+    bm25_ranks: dict,
+    derived_ranks: dict,
+    n_facts: int,
+    category: int,
+    pool_size: int,
+    include_atomic: bool,
+    cs_fn,
+    alpha: float = 0.0,
+    question: str = "",
+    content_by_fid: dict | None = None,
+) -> list:
+    """Rerank the top-pool_size candidates using the trained feature model."""
+    import hashlib as _hl                # noqa: PLC0415
+    import reranker as _rr               # noqa: PLC0415
+    model, scaler = _get_learned_model()
+    if model is None:
+        return sorted_ids
+    pool = sorted_ids[:pool_size]
+    tail = sorted_ids[pool_size:]
+    # Atomic boosts (optional)
+    atomic_boosts: dict[int, float] = {}
+    if include_atomic:
+        placeholders = ",".join("?" * len(pool))
+        content_rows = conn.execute(
+            f"SELECT id, content FROM facts WHERE id IN ({placeholders})", pool
+        ).fetchall()
+        fid_to_hash: dict[int, str] = {}
+        for fid, content in content_rows:
+            for ln in content.split("\n"):
+                if ln.startswith("[curr] "):
+                    curr_line = ln[len("[curr] "):]
+                    fid_to_hash[fid] = _hl.sha256(curr_line.encode()).hexdigest()[:16]
+                    break
+        if fid_to_hash:
+            hashes = list(set(fid_to_hash.values()))
+            ph2 = ",".join("?" * len(hashes))
+            atomic_rows = conn.execute(
+                f"""SELECT source_hash, embedding FROM facts
+                    WHERE project_id = ? AND fact_type = 'llm_atomic'
+                      AND source_hash IN ({ph2}) AND superseded_at IS NULL
+                      AND (valid_to IS NULL OR valid_to > unixepoch())""",
+                [pid, *hashes],
+            ).fetchall()
+            hash_to_max: dict[str, float] = {}
+            for sh, blob in atomic_rows:
+                if blob is None:
+                    continue
+                if isinstance(blob, (bytes, bytearray)):
+                    n_b = len(blob) // 4
+                    emb_a = list(struct.unpack(f"{n_b}f", blob))
+                else:
+                    try:
+                        emb_a = json.loads(blob)
+                    except Exception:
+                        continue
+                sim = cs_fn(q_emb, emb_a)
+                if sh not in hash_to_max or sim > hash_to_max[sh]:
+                    hash_to_max[sh] = sim
+            atomic_boosts = {
+                fid: hash_to_max[h]
+                for fid, h in fid_to_hash.items() if h in hash_to_max
+            }
+    # Content-based features: pre-compute question tokens and per-fid content
+    _q_tokens: frozenset = frozenset()
+    _content_pool: dict[int, str] = {}
+    if question:
+        _q_tokens = frozenset(
+            w.lower() for w in re.findall(r'\w+', question) if len(w) > 2
+        )
+    if content_by_fid:
+        _content_pool = {fid: content_by_fid[fid] for fid in pool if fid in content_by_fid}
+    feat = _rr.extract_features(
+        pool_fids      = pool,
+        rrf_scores     = rrf_scores,
+        cos_scores     = cos_sims,
+        cos_ranks      = cos_ranks,
+        bm25_ranks     = bm25_ranks,
+        derived_ranks  = derived_ranks,
+        atomic_boosts  = atomic_boosts,
+        n_facts        = n_facts,
+        category       = category,
+        question_tokens= _q_tokens,
+        content_by_fid = _content_pool,
+    )
+    reranked = _rr.rerank_pool(
+        pool, feat, model, scaler,
+        rrf_scores=rrf_scores if alpha > 0.0 else None,
+        alpha=alpha,
+    )
+    return reranked + tail
+
+
+# ── Atomic post-retrieval reranker ────────────────────────────────────────────
+
+def _atomic_rerank(
+    conn: sqlite3.Connection,
+    project_id: str,
+    q_emb: list,
+    top_fids: list,
+    rrf_scores: dict,
+    alpha: float,
+    cs_fn,
+    score_mode: str = "max",
+) -> list:
+    """Rerank top_fids using llm_atomic sibling facts as query-relevance signal.
+
+    For each window fact in top_fids, extract the [curr] line from content,
+    compute sha256("Speaker: text")[:16] — same formula as ingest source_hash —
+    then fetch sibling atomic facts, aggregate cosine sims per score_mode, and
+    combine with the original RRF score:
+
+    score_mode="max"  : boost = highest cosine among all siblings
+    score_mode="top2" : boost = max + 0.5 * second_best  (rewards multiple hits)
+    score_mode="rrf"  : atomic signal applied as a second RRF list (alpha = beta
+                        weight); windows without siblings get no atomic signal
+
+    Atomic facts are never surfaced as results — only used to score parent windows.
+    """
+    import hashlib as _hl  # lazy import — only used when flag is active
+
+    if not top_fids:
+        return top_fids
+
+    # Fetch content for each candidate window to extract [curr] line
+    placeholders = ",".join("?" * len(top_fids))
+    content_rows = conn.execute(
+        f"SELECT id, content FROM facts WHERE id IN ({placeholders})",
+        top_fids,
+    ).fetchall()
+
+    # Build fid -> turn_hash via sha256(curr_line)[:16] matching the ingest formula.
+    fid_to_turn_hash: dict[int, str] = {}
+    for fid, content in content_rows:
+        for ln in content.split("\n"):
+            if ln.startswith("[curr] "):
+                curr_line = ln[len("[curr] "):]  # "Speaker: text" (no prefix)
+                fid_to_turn_hash[fid] = _hl.sha256(curr_line.encode()).hexdigest()[:16]
+                break
+
+    if not fid_to_turn_hash:
+        return top_fids
+
+    # Fetch all llm_atomic facts linked to these turns
+    hashes = list(set(fid_to_turn_hash.values()))
+    ph2 = ",".join("?" * len(hashes))
+    atomic_rows = conn.execute(
+        f"""SELECT source_hash, embedding FROM facts
+            WHERE project_id = ?
+              AND fact_type = 'llm_atomic'
+              AND source_hash IN ({ph2})
+              AND superseded_at IS NULL
+              AND (valid_to IS NULL OR valid_to > unixepoch())""",
+        [project_id, *hashes],
+    ).fetchall()
+
+    # Decode embeddings; accumulate all cosine sims per turn_hash (sorted desc)
+    hash_to_sims: dict[str, list[float]] = {}
+    for sh, blob in atomic_rows:
+        if blob is None:
+            continue
+        if isinstance(blob, (bytes, bytearray)):
+            n = len(blob) // 4
+            emb = list(struct.unpack(f"{n}f", blob))
+        else:
+            try:
+                emb = json.loads(blob)
+            except Exception:
+                continue
+        sim = cs_fn(q_emb, emb)
+        if sh not in hash_to_sims:
+            hash_to_sims[sh] = []
+        hash_to_sims[sh].append(sim)
+    # Sort each list descending once
+    for sh in hash_to_sims:
+        hash_to_sims[sh].sort(reverse=True)
+
+    # Compute per-window atomic boost
+    def _boost(fid: int) -> float:
+        sh = fid_to_turn_hash.get(fid)
+        if not sh or sh not in hash_to_sims:
+            return 0.0
+        sims = hash_to_sims[sh]
+        if score_mode == "top2":
+            return sims[0] + 0.5 * sims[1] if len(sims) >= 2 else sims[0]
+        # default: "max" (also used as atomic signal for "rrf" mode)
+        return sims[0]
+
+    if score_mode == "rrf":
+        # Rank windows by atomic boost descending; combine via RRF with base ranks.
+        # Windows with no atomic siblings contribute 0 and are excluded from the
+        # atomic list — they keep their base RRF score unchanged.
+        _K_ATOMIC = 15  # same K as main RRF winner
+        fids_with_atomic = [fid for fid in top_fids if _boost(fid) > 0.0]
+        # Rank by atomic boost
+        fids_with_atomic.sort(key=_boost, reverse=True)
+        atomic_rank = {fid: r for r, fid in enumerate(fids_with_atomic)}
+        combined: dict[int, float] = {}
+        for fid in top_fids:
+            score = rrf_scores.get(fid, 0.0)
+            if fid in atomic_rank:
+                score += alpha / (_K_ATOMIC + atomic_rank[fid])
+            combined[fid] = score
+    else:
+        # "max" or "top2": additive boost
+        combined = {
+            fid: rrf_scores.get(fid, 0.0) + alpha * _boost(fid)
+            for fid in top_fids
+        }
+
+    return sorted(top_fids, key=combined.__getitem__, reverse=True)
+
+
 # ── Recall@K evaluation ───────────────────────────────────────────────────────
 
 def run_recall_eval(samples: list, db_path: str) -> dict:
@@ -899,11 +1196,18 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
         # the same turn, halving effective K.  Window rows carry the embedding
         # and are sufficient; turn rows help BM25/CE in production retrieve_facts()
         # but add no signal in this pure-cosine eval scorer.
+        # When _USE_LLM_ATOMIC_RERANK is active, also exclude llm_atomic from the
+        # first-stage pool — they will be used only as post-retrieval rerank signal.
+        _stage1_type_filter = (
+            "AND fact_type NOT IN ('turn', 'llm_atomic')"
+            if (_USE_LLM_ATOMIC_RERANK or _USE_LEARNED_RERANK or _LEARNED_RERANK_ATOMIC)
+            else "AND fact_type != 'turn'"
+        )
         rows = conn.execute(
-            """SELECT id, content, embedding FROM facts
+            f"""SELECT id, content, embedding FROM facts
                WHERE project_id = ?
                  AND superseded_at IS NULL
-                 AND fact_type != 'turn'
+                 {_stage1_type_filter}
                  AND (valid_to IS NULL OR valid_to > unixepoch())""",
             (pid,),
         ).fetchall()
@@ -1001,15 +1305,140 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                 # Speaker boost removed: regex-based speaker extraction produces too many
                 # false positives (capitalised words near auxiliary verbs), boosting wrong
                 # window rows and causing net-negative recall across all K values.
-                sorted_ids = sorted(rrf_scores, key=rrf_scores.__getitem__, reverse=True)
+
+                # ── Broad candidate pool (Phase 1) ─────────────────────────────────
+                # When _BROAD_POOL > 0: gather top-N from each signal into a union pool,
+                # then run RRF+reranker on this focused set instead of all facts.
+                # This lets the reranker see facts that rank well in ANY one signal
+                # (not just RRF top-N), dramatically improving R@40 ceiling.
+                if _BROAD_POOL > 0:
+                    _cos_order  = sorted(fids_in_cache, key=lambda f: cos_rank.get(f, n_facts))
+                    _bm25_order = sorted(fids_in_cache, key=lambda f: bm25_rank_eval.get(f, n_facts))
+                    _broad_parts = _cos_order[:_BROAD_POOL] + _bm25_order[:_BROAD_POOL]
+                    if _USE_DERIVED_BM25:
+                        _broad_parts += sorted(
+                            fids_in_cache, key=lambda f: derived_rank_eval.get(f, n_facts)
+                        )[:_BROAD_POOL]
+                    if _USE_LEXICAL_CHANNELS:
+                        import re as _re_lx  # noqa: PLC0415
+                        _STOPNAME = frozenset({
+                            'The', 'What', 'Who', 'When', 'Where', 'How', 'Does', 'Did',
+                            'Was', 'Are', 'Can', 'Will', 'Is', 'Do', 'Has', 'Have', 'Had',
+                            'Would', 'Could', 'Should', 'Which', 'Why', 'That', 'This',
+                            'His', 'Her', 'Its', 'Our', 'Their', 'Then', 'Than', 'From',
+                        })
+                        # Channel A: person-name — facts containing capitalised name tokens
+                        _name_toks = [w for w in _re_lx.findall(r'\b[A-Z][a-z]{2,}\b', qa["question"])
+                                      if w not in _STOPNAME]
+                        if _name_toks:
+                            _name_sc: dict[int, int] = {}
+                            for _fid in fids_in_cache:
+                                _c = content_by_fid_ev.get(_fid, "")
+                                _s = sum(_c.count(_n) for _n in _name_toks)
+                                if _s:
+                                    _name_sc[_fid] = _s
+                            _broad_parts += sorted(_name_sc, key=_name_sc.__getitem__, reverse=True)[:_BROAD_POOL]
+                        # Channel B: date/year — facts containing year or month-year from question
+                        _MONTH_RE = r'(?:January|February|March|April|May|June|July|August|September|October|November|December)'
+                        _date_toks = list(dict.fromkeys(
+                            _re_lx.findall(rf'\b{_MONTH_RE}\s+\d{{4}}\b|\b\d{{4}}\b', qa["question"])
+                        ))
+                        if _date_toks:
+                            _date_sc: dict[int, int] = {}
+                            for _fid in fids_in_cache:
+                                _c = content_by_fid_ev.get(_fid, "")
+                                _s = sum(_c.count(_d) for _d in _date_toks)
+                                if _s:
+                                    _date_sc[_fid] = _s
+                            _broad_parts += sorted(_date_sc, key=_date_sc.__getitem__, reverse=True)[:_BROAD_POOL]
+                        # Channel C: key-bigram — facts containing important adjacent word pairs
+                        _q_words_lx = [w for w in _re_lx.sub(r'[^a-z\s]', ' ', qa["question"].lower()).split()
+                                       if len(w) > 2 and w not in _BM25_STOPWORDS]
+                        if len(_q_words_lx) >= 2:
+                            _bigrams_lx = [f"{_q_words_lx[i]} {_q_words_lx[i+1]}"
+                                           for i in range(len(_q_words_lx) - 1)]
+                            _bgram_hits: list[int] = []
+                            for _fid in fids_in_cache:
+                                _c = content_by_fid_ev.get(_fid, "").lower()
+                                if any(_bg in _c for _bg in _bigrams_lx):
+                                    _bgram_hits.append(_fid)
+                            _broad_parts += _bgram_hits[:_BROAD_POOL]
+                    _broad_cands = list(dict.fromkeys(_broad_parts))
+                    _broad_set   = set(_broad_cands)
+                    _broad_sorted = sorted(_broad_cands, key=lambda f: rrf_scores.get(f, 0.0), reverse=True)
+                    _tail_sorted  = sorted(
+                        (f for f in fids_in_cache if f not in _broad_set),
+                        key=lambda f: rrf_scores.get(f, 0.0), reverse=True
+                    )
+                    sorted_ids           = _broad_sorted + list(_tail_sorted)
+                    _reranker_pool_size  = len(_broad_cands)
+                else:
+                    sorted_ids = sorted(rrf_scores, key=rrf_scores.__getitem__, reverse=True)
+                    _reranker_pool_size = _LEARNED_RERANK_POOL
+
+                # Snapshot pre-rerank order for coverage protection
+                _rrf_sorted_backup = list(sorted_ids) if _COVERAGE_PROTECT_K > 0 else None
+
+                # Atomic post-retrieval rerank: boost top-40 windows using llm_atomic
+                # sibling facts as additional query-relevance signal.  Atomic facts are
+                # excluded from the first-stage pool and only used here as a scoring hint.
+                if _USE_LLM_ATOMIC_RERANK and sorted_ids:
+                    _rerank_top = min(_LLM_ATOMIC_POOL, len(sorted_ids))
+                    _reranked = _atomic_rerank(
+                        conn, pid, q_emb,
+                        sorted_ids[:_rerank_top],
+                        rrf_scores, _LLM_ATOMIC_ALPHA, _cs,
+                        score_mode=_LLM_ATOMIC_SCORE_MODE,
+                    )
+                    sorted_ids = _reranked + sorted_ids[_rerank_top:]
+                # Learned feature reranker: combines cos/BM25/derived/atomic signals
+                # using a pre-trained GBM. Run train_reranker.py first.
+                if _USE_LEARNED_RERANK and sorted_ids:
+                    sorted_ids = _apply_learned_rerank(
+                        conn           = conn,
+                        pid            = pid,
+                        q_emb          = q_emb,
+                        sorted_ids     = sorted_ids,
+                        rrf_scores     = rrf_scores,
+                        cos_ranks      = cos_rank,
+                        cos_sims       = {fid: _cs(q_emb, emb) for fid, _, emb in fact_cache},
+                        bm25_ranks     = bm25_rank_eval,
+                        derived_ranks  = derived_rank_eval if _USE_DERIVED_BM25 else {},
+                        n_facts        = n_facts,
+                        category       = qa["category"],
+                        pool_size      = _reranker_pool_size,
+                        include_atomic = _LEARNED_RERANK_ATOMIC,
+                        cs_fn          = _cs,
+                        alpha          = _LEARNED_RERANK_ALPHA,
+                        question       = qa["question"],
+                        content_by_fid = content_by_fid_ev,
+                    )
+                    # ── Coverage protection (Phase 3) ───────────────────────────────
+                    # Min-rank ensemble: final rank = min(reranker_rank, rrf_rank).
+                    # Guarantees R@K cannot fall below the RRF baseline: any fact in
+                    # RRF top-K keeps an effective rank ≤ K in the final output.
+                    if _COVERAGE_PROTECT_K > 0 and _rrf_sorted_backup is not None:
+                        _rnk_rank = {fid: r for r, fid in enumerate(sorted_ids)}
+                        _rrf_rank = {fid: r for r, fid in enumerate(_rrf_sorted_backup)}
+                        _n_ids    = len(sorted_ids)
+                        sorted_ids = sorted(
+                            sorted_ids,
+                            key=lambda f: min(
+                                _rnk_rank.get(f, _n_ids),
+                                _rrf_rank.get(f, _n_ids),
+                            ),
+                        )
                 # CE disabled: mxbai-rerank-xsmall is not calibrated for
                 # [prev]/[curr]/[next] window format and actively demotes correct facts.
+                # Snapshot pre-CE order for CE coverage guard.
+                _pre_ce_sorted = list(sorted_ids) if (_USE_CE_IN_RECALL_EVAL and _CE_GUARD_K > 0) else None
                 if _USE_CE_IN_RECALL_EVAL:
                     try:
                         from utils import get_cross_encoder as _gce  # noqa: PLC0415
+                        import math as _math  # noqa: PLC0415
                         _ce = _gce()
                         if _ce is not None and len(sorted_ids) > 5:
-                            _ce_pool_fids = [fid for fid in sorted_ids[:100]
+                            _ce_pool_fids = [fid for fid in sorted_ids[:_CE_POOL_SIZE]
                                              if fid in content_by_fid_ev]
                             # Feed only [curr] line to CE — window format confuses CE;
                             # the [curr] speaker:text is what the question asks about.
@@ -1022,12 +1451,37 @@ def run_recall_eval(samples: list, db_path: str) -> dict:
                             _ce_pairs = [(qa["question"], _curr_text(content_by_fid_ev[fid]))
                                          for fid in _ce_pool_fids]
                             _ce_scores = _ce.predict(_ce_pairs)
-                            _ce_reranked = [fid for fid, _ in sorted(
-                                zip(_ce_pool_fids, _ce_scores),
-                                key=lambda x: x[1], reverse=True,
-                            )]
-                            _ce_tail = [fid for fid in sorted_ids[100:]]
+                            if _CE_ALPHA > 0.0:
+                                # Blend: GBM rank (inverted, normalised) + alpha * sigmoid(ce_score)
+                                _n_pool = len(_ce_pool_fids)
+                                _ce_combined = []
+                                for _ci, (fid, _ce_s) in enumerate(zip(_ce_pool_fids, _ce_scores)):
+                                    _rank_norm = 1.0 - _ci / _n_pool  # 1→0 as rank increases
+                                    _ce_sig = 1.0 / (1.0 + _math.exp(-float(_ce_s)))
+                                    _ce_combined.append((fid, _rank_norm + _CE_ALPHA * _ce_sig))
+                                _ce_reranked = [fid for fid, _ in sorted(
+                                    _ce_combined, key=lambda x: x[1], reverse=True)]
+                            else:
+                                # Pure CE replacement (original behaviour)
+                                _ce_reranked = [fid for fid, _ in sorted(
+                                    zip(_ce_pool_fids, _ce_scores),
+                                    key=lambda x: x[1], reverse=True,
+                                )]
+                            _ce_tail = [fid for fid in sorted_ids[_CE_POOL_SIZE:]]
                             sorted_ids = _ce_reranked + _ce_tail
+                            # CE coverage guard: min-rank ensemble of CE rank and pre-CE rank.
+                            # Prevents CE from pushing items out of top-K that were there before.
+                            if _CE_GUARD_K > 0 and _pre_ce_sorted is not None:
+                                _ce_rnk  = {fid: r for r, fid in enumerate(sorted_ids)}
+                                _pre_rnk = {fid: r for r, fid in enumerate(_pre_ce_sorted)}
+                                _n_ce    = len(sorted_ids)
+                                sorted_ids = sorted(
+                                    sorted_ids,
+                                    key=lambda f: min(
+                                        _ce_rnk.get(f, _n_ce),
+                                        _pre_rnk.get(f, _n_ce),
+                                    ),
+                                )
                     except Exception:
                         pass
                 # Diagnostic: record gold fact ranks

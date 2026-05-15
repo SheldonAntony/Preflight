@@ -1,0 +1,38 @@
+{
+  "db_letter": "H",
+  "pool_size": 200,
+  "broad_pool_n": 200,
+  "model_type": "gbm",
+  "include_atomic": false,
+  "rrf_k": 15,
+  "use_derived": true,
+  "n_train": 1522,
+  "features": [
+    "rrf_score",
+    "rrf_rank_norm",
+    "cos_score",
+    "cos_rank_norm",
+    "bm25_rank_norm",
+    "bm25_found",
+    "derived_rank_norm",
+    "derived_found",
+    "atomic_boost",
+    "has_atomic",
+    "rrf_bm25_derived_sum",
+    "is_temporal",
+    "is_multihop",
+    "token_overlap",
+    "speaker_in_q",
+    "n_signals",
+    "is_temporal_q",
+    "is_multihop_q"
+  ],
+  "n_features": 18,
+  "loocv_avg": {
+    "1": 46.98,
+    "3": 69.02,
+    "5": 77.22,
+    "10": 83.99,
+    "40": 93.28
+  }
+}

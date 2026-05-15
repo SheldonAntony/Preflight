@@ -15,3 +15,20 @@ diagnose_misses.py
 __pycache__/
 *.pyc
 *.pyo
+
+# Large binary model files (too big for git)
+bge-small-engram-v1/
+bge-small-engram-v2/
+bge-small-engram-v3/
+
+# Trained model binaries (regenerate with train_reranker.py)
+reranker_model.pkl
+reranker_scaler.pkl
+featcache_*.pkl
+
+# Training data (large, not needed for eval)
+engram_pairs*.jsonl
+engram_triplets*.jsonl
+
+# Training logs
+train_log*.txt

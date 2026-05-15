@@ -56,12 +56,16 @@ args = parser.parse_args()
 DB_PATH = os.path.join(_PREFLIGHT_DIR, f"locomo_eval_{args.db_letter}.db")
 
 # Auto-generate tag from active flags if not specified manually
-_sw  = os.environ.get("PREFLIGHT_USE_STOPWORDS",     "0")
-_bw  = os.environ.get("PREFLIGHT_BM25_WEIGHT",       "1.0")
-_ce  = os.environ.get("PREFLIGHT_USE_CE",             "0")
-_sp  = os.environ.get("PREFLIGHT_SPEAKER_BOOST",     "0")
-_llm = os.environ.get("PREFLIGHT_USE_LLM_EXTRACTOR", "0")
-_rk  = os.environ.get("PREFLIGHT_RRF_K",             "60")
+_sw  = os.environ.get("PREFLIGHT_USE_STOPWORDS",          "0")
+_bw  = os.environ.get("PREFLIGHT_BM25_WEIGHT",            "1.0")
+_ce  = os.environ.get("PREFLIGHT_USE_CE",                 "0")
+_sp  = os.environ.get("PREFLIGHT_SPEAKER_BOOST",          "0")
+_llm = os.environ.get("PREFLIGHT_USE_LLM_EXTRACTOR",      "0")
+_rk  = os.environ.get("PREFLIGHT_RRF_K",                  "60")
+_ar  = os.environ.get("PREFLIGHT_USE_LLM_ATOMIC_RERANK",  "0")
+_aa  = os.environ.get("PREFLIGHT_LLM_ATOMIC_ALPHA",       "0.10")
+_as  = os.environ.get("PREFLIGHT_LLM_ATOMIC_SCORE",       "max")
+_ap  = os.environ.get("PREFLIGHT_LLM_ATOMIC_POOL",        "40")
 
 if args.tag:
     tag = args.tag
@@ -85,9 +89,17 @@ print(f"  _USE_EVAL_SPEAKER_BOOST: {ev._USE_EVAL_SPEAKER_BOOST}")
 print(f"  _RRF_K                 : {ev._RRF_K}")
 print(f"  _USE_DERIVED_BM25      : {ev._USE_DERIVED_BM25}")
 print(f"  _POOL_A_SIZE           : {ev._POOL_A_SIZE}")
+print(f"  _USE_LLM_ATOMIC_RERANK : {ev._USE_LLM_ATOMIC_RERANK}")
+print(f"  _LLM_ATOMIC_ALPHA      : {ev._LLM_ATOMIC_ALPHA}")
+print(f"  _LLM_ATOMIC_SCORE_MODE : {ev._LLM_ATOMIC_SCORE_MODE}")
+print(f"  _LLM_ATOMIC_POOL       : {ev._LLM_ATOMIC_POOL}")
 print(f"  LLM extractor          : {_llm == '1'}")
 print(f"  LLM workers            : {os.environ.get('PREFLIGHT_LLM_WORKERS', '4')}")
 print(f"  store_turn             : False (benchmark mode)")
+_eb = os.environ.get("ENGRAM_EMBED_BACKEND", "fastembed")
+_em = os.environ.get("ENGRAM_EMBED_MODEL", "(default)")
+print(f"  Embed backend          : {_eb}")
+print(f"  Embed model            : {_em}")
 print(f"  Reingest               : {args.reingest}")
 print(f"  DB path                : {DB_PATH}")
 print(f"  DB exists              : {os.path.exists(DB_PATH)}")
@@ -142,6 +154,12 @@ result["_ablation"] = {
     "USE_CE_IN_RECALL_EVAL":     ev._USE_CE_IN_RECALL_EVAL,
     "USE_EVAL_SPEAKER_BOOST":    ev._USE_EVAL_SPEAKER_BOOST,
     "USE_LLM_EXTRACTOR":         _llm == "1",
+    "USE_LLM_ATOMIC_RERANK":     _ar == "1",
+    "LLM_ATOMIC_ALPHA":          float(_aa),
+    "LLM_ATOMIC_SCORE_MODE":     _as,
+    "LLM_ATOMIC_POOL":           int(_ap),
+    "embed_backend":             _eb,
+    "embed_model":               _em,
     "reingest":                  args.reingest,
     "db_letter":                 args.db_letter,
     "elapsed_s":                 round(elapsed, 1),
