@@ -591,14 +591,23 @@ C:\Users\Sheldon Antony\.config\
 
 ---
 
-## v11 Results (to be filled in)
+## v11 Results (B DB — lexical channels)
 
 ```
-R@1:  TBD
-R@3:  TBD   (v8 champion: 80.81%)
-R@5:  TBD   (v8 champion: 86.93%)
-R@10: TBD   (v8 champion: 91.52%)
-R@40: TBD   (v8 champion: 96.98%)
+R@1:  64.21%
+R@3:  80.47%   ← compare to v8_bdb_control, NOT v8 H-DB (80.81%)
+R@5:  86.15%
+R@10: 90.33%
+R@40: 95.75%
 
-Decision: PENDING
+By category (R@5):
+  Single-hop:  56.18%
+  Multi-hop:   83.27%
+  Temporal:    85.00%
+  Open-domain: 90.73%
+
+Elapsed: 17203.8s
+Decision: PENDING — need v8_bdb_control on B DB to compare fairly
 ```
+
+**⚠️ Cannot compare to v8 (H DB) directly.** Must run `v8_bdb_control` (v8 config, B DB, no lexical channels) first.
